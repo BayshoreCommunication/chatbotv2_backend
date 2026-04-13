@@ -25,7 +25,7 @@ class ChatRouterFlowTests(unittest.TestCase):
         )
         self.assertIsNotNone(reply)
         self.assertIn("I have your details", reply or "")
-        self.assertIn("15-30 minutes", reply or "")
+        self.assertIn("shortly", reply or "")
 
     def test_no_short_circuit_when_already_captured(self) -> None:
         text = "my name is sahak my phone is 0147852369"

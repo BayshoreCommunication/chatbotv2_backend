@@ -18,9 +18,13 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 
 from database import get_database
-from services.chatbot import build_company_agent, get_cached_tool_names
+from services.chatbot import (
+    build_company_agent,
+    get_cached_tool_names,
+    register_thread_activity,
+)
 from services.chatbot.company_context import get_company_context
-from services.chatbot.lead_extractor import LeadInfo, extract_lead_info
+from services.chatbot.lead_extractor import LeadInfo, extract_lead_info_async
 from services.chatbot.session_cache import (
     create_or_refresh_session,
     get_session,
@@ -166,13 +170,14 @@ async def chat(company_id: str, payload: ChatRequest):
             session.user_timezone = (payload.user_timezone or "").strip() or None
 
     session_lead = session.to_lead_dict()
-    message_lead = extract_lead_info(payload.message)
+    message_lead = await extract_lead_info_async(payload.message)
     effective_lead_name = message_lead.name or session_lead["lead_name"]
     effective_lead_phone = message_lead.phone or session_lead["lead_phone"]
     effective_lead_email = message_lead.email or session_lead["lead_email"]
+    # A name alone is NOT enough — we need at least a phone or email to reach the user.
+    # Only suppress the intake flow once we have a real contact method.
     lead_captured_effective = bool(
         session_lead["lead_captured"]
-        or message_lead.has_any
         or effective_lead_phone
         or effective_lead_email
     )
@@ -207,6 +212,7 @@ async def chat(company_id: str, payload: ChatRequest):
             user_message=payload.message,
             ai_reply=reply,
             tools_used=tools_used,
+            lead_info=message_lead,
         )
         return ChatResponse(
             reply=reply,
@@ -218,6 +224,8 @@ async def chat(company_id: str, payload: ChatRequest):
     # ── Invoke agent — LangGraph uses thread_id for per-session memory ────────
     # thread_id is already set above (session cache lookup)
     config = {"configurable": {"thread_id": thread_id}}
+    register_thread_activity(thread_id)
+    available_tools = get_cached_tool_names(company_id)
 
     logger.info(
         "chat.agent.invoke company_id=%s session_id=%s thread_id=%s",
@@ -228,6 +236,7 @@ async def chat(company_id: str, payload: ChatRequest):
     try:
         input_messages: list[tuple[str, str]] = []
         if lead_captured_effective:
+            # We have a real contact method (phone or email) — suppress re-asking.
             input_messages.append(
                 (
                     "system",
@@ -251,6 +260,22 @@ async def chat(company_id: str, payload: ChatRequest):
                     ),
                 )
             )
+        elif effective_lead_name and not effective_lead_phone and not effective_lead_email:
+            # We have the user's name but no contact method yet — remind the agent
+            # to acknowledge the name and ask specifically for phone or email.
+            input_messages.append(
+                (
+                    "system",
+                    (
+                        f"The user has shared their name: {effective_lead_name}. "
+                        "You do NOT yet have a phone number or email address for this person. "
+                        "STRICT RULE: Acknowledge their name warmly, then ask specifically for "
+                        "their best phone number (or email) so the team can follow up. "
+                        "Do NOT say 'I already have your details' — you only have a name, not a contact method."
+                    ),
+                )
+            )
+        input_messages.append(("system", _build_tool_order_instruction(available_tools)))
         user_timezone = (payload.user_timezone or "").strip()
         if user_timezone:
             input_messages.append(
@@ -302,7 +327,10 @@ async def chat(company_id: str, payload: ChatRequest):
                 tools_used.append(name)
             tool_outputs.append(str(getattr(msg, "content", "")))
 
-    if _is_information_request(payload.message) and not tools_used:
+    has_fact_tools = any(
+        tool_name in available_tools for tool_name in ("knowledge_base", "web_search", "wikipedia")
+    )
+    if _is_information_request(payload.message) and not tools_used and has_fact_tools:
         logger.info(
             "chat.agent.retry_tool_enforced company_id=%s session_id=%s reason=no_tools_used_first_pass",
             company_id,
@@ -313,14 +341,7 @@ async def chat(company_id: str, payload: ChatRequest):
         retry_messages = [
             (
                 "system",
-                (
-                    "You must verify via tools for this request. "
-                    "Tool order is mandatory: 1) knowledge_base 2) web_search (DuckDuckGo) 3) wikipedia. "
-                    "If one source is insufficient, continue to the next. "
-                    "If all are insufficient, explicitly say information is not verified and do not guess. "
-                    "CRITICAL EXCEPTION: If the question is completely OFF-TOPIC (e.g., politics, sports, trivia), "
-                    "you MUST completely ignore this tool rule. Do NOT use any tools. Just politely refuse the question."
-                ),
+                _build_tool_order_instruction(available_tools),
             ),
             ("user", payload.message),
         ]
@@ -401,6 +422,7 @@ async def chat(company_id: str, payload: ChatRequest):
         user_message=payload.message,
         ai_reply=reply,
         tools_used=tools_used,
+        lead_info=message_lead,
     )
 
     return ChatResponse(
@@ -552,13 +574,14 @@ async def _persist_exchange(
     user_message: str,
     ai_reply: str,
     tools_used: list[str],
+    lead_info: LeadInfo | None = None,
 ) -> None:
     """
     Upsert this chat exchange into the `chat_sessions` MongoDB collection.
 
     Steps performed on every turn:
       1. Append user + AI messages to the session.
-      2. Scan the user message for name / phone / email via regex (zero LLM cost).
+      2. Reuse lead info extracted during this turn (single LLM extraction).
       3. If new lead data is found, set `lead_captured = True` and store the
          contact fields (lead_name, lead_phone, lead_email) on the session.
       4. Upsert a document in the `leads` collection so the company can view
@@ -568,8 +591,9 @@ async def _persist_exchange(
         db  = get_database()
         now = datetime.now(timezone.utc)
 
-        # ── 1. Extract lead info from the user's message (regex, no LLM) ──────
-        lead_info = extract_lead_info(user_message)
+        # Reuse extracted lead info from chat() to avoid a second LLM call.
+        if lead_info is None:
+            lead_info = await extract_lead_info_async(user_message)
 
         # ── 2. Build the $set payload ─────────────────────────────────────────
         set_fields: dict = {"updated_at": now}
@@ -583,11 +607,13 @@ async def _persist_exchange(
             if lead_info.email:
                 set_fields["lead_email"] = lead_info.email
 
-            logger.info(
+            logger.debug(
                 "chat.lead.detected company_id=%s session_id=%s "
                 "name=%r phone=%r email=%r",
                 company_id, session_id,
-                lead_info.name, lead_info.phone, lead_info.email,
+                _mask_value(lead_info.name),
+                _mask_value(lead_info.phone),
+                _mask_value(lead_info.email),
             )
 
         # ── 3. Build the messages to append ───────────────────────────────────
@@ -684,6 +710,37 @@ def _slice_current_turn_messages(messages: list, user_message: str) -> list:
             break
 
     return messages[idx:] if idx >= 0 else messages
+
+
+def _mask_value(value: str | None, keep_tail: int = 2) -> str:
+    if not value:
+        return "none"
+    if len(value) <= keep_tail:
+        return "*" * len(value)
+    return ("*" * (len(value) - keep_tail)) + value[-keep_tail:]
+
+
+def _build_tool_order_instruction(available_tools: list[str]) -> str:
+    ordered_tools = [
+        tool_name
+        for tool_name in ("knowledge_base", "web_search", "wikipedia")
+        if tool_name in available_tools
+    ]
+    if not ordered_tools:
+        return (
+            "No factual verification tools are currently available. "
+            "Do not invent facts, and clearly ask a focused follow-up question when uncertain."
+        )
+
+    steps = " -> ".join(ordered_tools)
+    return (
+        "You must verify factual/company answers with available tools. "
+        f"Required order (only tools currently available): {steps}. "
+        "If one source is insufficient, continue to the next available source. "
+        "If all are insufficient, explicitly say information is not verified and do not guess. "
+        "CRITICAL EXCEPTION: If the question is completely OFF-TOPIC (e.g., politics, sports, trivia), "
+        "do not use tools and politely refuse."
+    )
 
 
 def _tool_outputs_insufficient(tool_outputs: list[str]) -> bool:
@@ -844,6 +901,8 @@ def _looks_like_contact_share_message(message: str) -> bool:
     text = (message or "").strip().lower()
     if not text:
         return False
+
+    # Keyword-based detection (e.g. "my name is...", "my phone is...", "email me at...")
     indicators = (
         "my name",
         "name is",
@@ -853,4 +912,15 @@ def _looks_like_contact_share_message(message: str) -> bool:
         "email",
         "@",
     )
-    return any(token in text for token in indicators)
+    if any(token in text for token in indicators):
+        return True
+
+    # Raw phone number detection: message is mostly digits (e.g. "01792843207", "+1 555 1234")
+    # Strip common phone separators and count digits vs total length.
+    stripped = text.replace(" ", "").replace("-", "").replace("+", "").replace("(", "").replace(")", "").replace(".", "")
+    if stripped and len(stripped) >= 6:
+        digit_ratio = sum(c.isdigit() for c in stripped) / len(stripped)
+        if digit_ratio >= 0.8:
+            return True
+
+    return False

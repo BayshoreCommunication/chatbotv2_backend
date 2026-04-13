@@ -32,12 +32,23 @@ logger = logging.getLogger(__name__)
 _ctx_cache: dict[str, dict[str, Any]] = {}
 _ctx_lock  = asyncio.Lock()
 _CTX_TTL   = 300  # seconds (5 minutes)
+_CTX_MAX_SIZE = 1000
 
 
 def invalidate_context(company_id: str) -> None:
     """Remove a company's cached context (call after re-training)."""
     _ctx_cache.pop(company_id, None)
     logger.info("company_context.invalidated company_id=%s", company_id)
+
+
+def _trim_ctx_cache_if_needed() -> None:
+    while len(_ctx_cache) > _CTX_MAX_SIZE:
+        oldest_company_id = next(iter(_ctx_cache))
+        _ctx_cache.pop(oldest_company_id, None)
+        logger.info(
+            "company_context.evicted company_id=%s reason=max_size",
+            oldest_company_id,
+        )
 
 
 async def get_company_context(company_id: str) -> dict[str, Any] | None:
@@ -61,6 +72,8 @@ async def get_company_context(company_id: str) -> dict[str, Any] | None:
     # ── Cache hit ─────────────────────────────────────────────────────────────
     cached = _ctx_cache.get(company_id)
     if cached and cached["expires"] > time.monotonic():
+        _ctx_cache.pop(company_id, None)
+        _ctx_cache[company_id] = cached
         elapsed = int((time.monotonic() - t0) * 1000)
         logger.debug(
             "company_context.cache_hit company_id=%s elapsed_ms=%d",
@@ -83,6 +96,8 @@ async def get_company_context(company_id: str) -> dict[str, Any] | None:
         # Double-check after acquiring lock
         cached = _ctx_cache.get(company_id)
         if cached and cached["expires"] > time.monotonic():
+            _ctx_cache.pop(company_id, None)
+            _ctx_cache[company_id] = cached
             return cached["data"]
 
         db = get_database()
@@ -127,6 +142,7 @@ async def get_company_context(company_id: str) -> dict[str, Any] | None:
         }
 
         _ctx_cache[company_id] = {"data": ctx, "expires": time.monotonic() + _CTX_TTL}
+        _trim_ctx_cache_if_needed()
 
         elapsed = int((time.monotonic() - t0) * 1000)
         logger.info(

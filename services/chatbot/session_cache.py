@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 _SESSION_TTL = 1800  # 30 minutes of inactivity
+_SESSION_MAX_SIZE = 5000
 
 # ── In-memory store ───────────────────────────────────────────────────────────
 # { thread_id: SessionData }
@@ -36,6 +37,14 @@ _session_store: dict[str, "SessionData"] = {}
 # Per-session asyncio locks (same double-lock pattern as agent.py)
 _session_locks: dict[str, asyncio.Lock] = {}
 _locks_meta_lock = asyncio.Lock()
+
+
+def _mask_value(value: str | None, keep_tail: int = 2) -> str:
+    if not value:
+        return "none"
+    if len(value) <= keep_tail:
+        return "*" * len(value)
+    return ("*" * (len(value) - keep_tail)) + value[-keep_tail:]
 
 
 # ── Data model ────────────────────────────────────────────────────────────────
@@ -91,6 +100,18 @@ def _cleanup_expired() -> None:
         logger.debug("session_cache.evicted thread_id=%s reason=ttl_expired", tid)
     if dead:
         logger.info("session_cache.cleanup evicted=%d remaining=%d", len(dead), len(_session_store))
+
+
+def _trim_max_sessions_if_needed() -> None:
+    while len(_session_store) > _SESSION_MAX_SIZE:
+        oldest_thread_id = next(iter(_session_store))
+        _session_store.pop(oldest_thread_id, None)
+        _session_locks.pop(oldest_thread_id, None)
+        logger.info(
+            "session_cache.evicted thread_id=%s reason=max_size remaining=%d",
+            oldest_thread_id,
+            len(_session_store),
+        )
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -162,6 +183,7 @@ async def create_or_refresh_session(
             user_timezone=user_timezone,
         )
         _session_store[thread_id] = session
+        _trim_max_sessions_if_needed()
 
         logger.info(
             "session_cache.created thread_id=%s company_id=%s "
@@ -204,9 +226,12 @@ def update_session_lead(
     if updated:
         session.lead_captured = True
         session.touch()
-        logger.info(
+        logger.debug(
             "session_cache.lead_updated thread_id=%s name=%r phone=%r email=%r",
-            thread_id, session.lead_name, session.lead_phone, session.lead_email,
+            thread_id,
+            _mask_value(session.lead_name),
+            _mask_value(session.lead_phone),
+            _mask_value(session.lead_email),
         )
 
     return True
