@@ -12,12 +12,17 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Write SSH key from base64
+        run: |
+          echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
       - name: Deploy to server via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: 68.183.227.9
           username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          key_path: /tmp/deploy_key
           fingerprint: ${{ secrets.SSH_FINGERPRINT }}
           script: |
             set -e
@@ -39,3 +44,4 @@ jobs:
             echo "=== Health check ==="
             curl -sf http://127.0.0.1:8000/docs > /dev/null
             echo "Deploy complete!"
+
