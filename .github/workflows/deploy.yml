@@ -1,4 +1,4 @@
-name: Deploy to DigitalOcean
+name: Deploy to Production
 
 on:
   push:
@@ -7,41 +7,43 @@ on:
 
 jobs:
   deploy:
-    name: SSH Deploy
+    name: Deploy to DigitalOcean
     runs-on: ubuntu-latest
-    timeout-minutes: 10
 
     steps:
-      - name: Write SSH key from base64
-        run: |
-          echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > /tmp/deploy_key
-          chmod 600 /tmp/deploy_key
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Deploy to server via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: 68.183.227.9
-          username: root
-          key_path: /tmp/deploy_key
-          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
-          script: |
+      - name: Setup SSH key file
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DO_SSH_KEY }}" | base64 -d > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ secrets.DO_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy via SSH
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.DO_USERNAME }}@${{ secrets.DO_HOST }} << 'ENDSSH'
             set -e
 
-            echo "=== Pulling latest code ==="
             cd /var/www/chatbot_backend
+
+            echo "📥 Pulling latest code..."
             git pull origin main
 
-            echo "=== Installing/updating dependencies ==="
+            echo "📦 Installing dependencies..."
             .venv/bin/pip install -r requirements.txt -q
 
-            echo "=== Restarting service ==="
+            echo "♻️ Restarting service..."
             systemctl restart chatbot_backend
-
-            echo "=== Verifying service is running ==="
             sleep 2
+
+            echo "✅ Checking service status..."
             systemctl is-active chatbot_backend
 
-            echo "=== Health check ==="
+            echo "🌐 Health check..."
             curl -sf http://127.0.0.1:8000/docs > /dev/null
-            echo "Deploy complete!"
+
+            echo "🚀 Deployment complete!"
+          ENDSSH
 
