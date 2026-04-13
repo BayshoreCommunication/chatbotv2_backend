@@ -14,7 +14,7 @@ scp -r routers %REMOTE%:routers
 
 :: Update files on server using cp -rf to correctly merge/overwrite directories
 echo [2/4] Updating files in /opt/chatbotv2/...
-ssh %REMOTE% "cp -rf main.py .env schemas services routers /opt/*v2/"
+ssh %REMOTE% "cp -rf main.py .env schemas services routers /var/www/chatbot_backend/"
 
 :: Clean up home directory
 echo [3/4] Cleaning up root home...
@@ -22,7 +22,7 @@ ssh %REMOTE% "rm -rf main.py .env schemas services routers"
 
 :: Restart service
 echo [4/4] Restarting backend service...
-ssh %REMOTE% "systemctl restart chatbotv2 && systemctl status chatbotv2 --no-pager"
+ssh %REMOTE% "systemctl restart chatbot_backend && systemctl status chatbot_backend --no-pager"
 
 echo.
 echo === Deployment Complete! ===
