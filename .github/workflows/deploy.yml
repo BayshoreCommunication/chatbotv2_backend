@@ -18,7 +18,7 @@ jobs:
           host: 68.183.227.9
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+          fingerprint: ${{ secrets.SSH_FINGERPRINT }}
           script: |
             set -e
 
