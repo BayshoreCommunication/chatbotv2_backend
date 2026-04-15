@@ -198,20 +198,81 @@ def build_tools(
     return tools
 
 
-def _format_slots_for_tool(slots: list[dict[str, str]]) -> str:
+
+def _utc_iso_to_local(iso_str: str, user_timezone: str) -> str:
+    """
+    Convert a UTC ISO-8601 string (e.g. "2026-04-16T03:30:00Z") to a
+    human-readable local time string using user_timezone (IANA name).
+    Returns the original string on any parsing failure.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+        dt_utc = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        tz_obj = ZoneInfo(user_timezone)
+        dt_local = dt_utc.astimezone(tz_obj)
+        return dt_local.strftime("%B %d, %Y at %I:%M %p") + f" ({user_timezone})"
+    except Exception:
+        return f"{iso_str} (UTC)"
+
+
+def _preferred_time_to_utc_fragment(preferred_time: str, user_timezone: str) -> str:
+    """
+    Given a natural-language preferred time (e.g. '7 pm', '19:00', '3:30 pm')
+    and the user's IANA timezone, return the equivalent UTC time fragment (HH:MM)
+    for substring-matching against ISO timestamps.
+
+    Returns the original preferred_time string (lowercased) on any failure so
+    the caller's fallback logic is unharmed.
+    """
+    if not preferred_time or not user_timezone:
+        return preferred_time.strip().lower()
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime, timezone as dt_tz
+        tz_obj = ZoneInfo(user_timezone)
+        today = datetime.now(tz_obj).date()
+        text = preferred_time.strip().upper()
+        local_dt: datetime | None = None
+        for fmt in ("%I %p", "%I:%M %p", "%H:%M", "%I%p", "%H"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                local_dt = parsed.replace(
+                    year=today.year, month=today.month, day=today.day,
+                    tzinfo=tz_obj,
+                )
+                break
+            except ValueError:
+                continue
+        if local_dt is None:
+            return preferred_time.strip().lower()
+        utc_dt = local_dt.astimezone(dt_tz.utc)
+        return utc_dt.strftime("%H:%M")  # e.g. "13:00" to match inside ISO string
+    except Exception:
+        return preferred_time.strip().lower()
+
+
+def _format_slots_for_tool(slots: list[dict[str, str]], user_timezone: str = "") -> str:
     if not slots:
         return "No available slots were found in the next 7 days."
 
     lines: list[str] = []
     for idx, slot in enumerate(slots, start=1):
+        start_iso = slot["start_time"]
+        if user_timezone:
+            display = _utc_iso_to_local(start_iso, user_timezone)
+        else:
+            display = f"{start_iso} (UTC)"
         lines.append(
-            f"{idx}. {slot['start_time']} | confirmation_url={slot['scheduling_url']}"
+            f"{idx}. {display} | iso_start_time={start_iso} | confirmation_url={slot['scheduling_url']}"
         )
     return (
-        "Available slots (UTC):\n"
+        "Available slots:\n"
         + "\n".join(lines)
         + "\n"
-        + "Ask the user to choose one slot, then share the confirmation page."
+        + "IMPORTANT: When presenting slots to the user, show only the human-readable local time "
+        "(before the pipe). Use the iso_start_time value when calling get_slot_booking_link. "
+        "Ask the user to choose one slot, then share the confirmation page."
     )
 
 
@@ -243,10 +304,16 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
         "get_available_appointment_slots",
         description=(
             "Get real available appointment slots for the configured Calendly event type "
-            "for the next 7 days. Returns ISO start times and confirmation URLs."
+            "for the next 7 days. Returns times in the user's local timezone when user_timezone is provided. "
+            "Pass preferred_time as the user's stated preference (e.g. '7 pm', '14:00') and "
+            "user_timezone as the IANA timezone string (e.g. 'Asia/Dhaka', 'America/New_York') "
+            "so slots are matched and displayed in the user's local time."
         ),
     )
-    async def get_available_appointment_slots(preferred_time: str = "") -> str:
+    async def get_available_appointment_slots(
+        preferred_time: str = "",
+        user_timezone: str = "",
+    ) -> str:
         db = get_database()
         settings_doc = await get_user_calendly_settings(db, company_id)
 
@@ -280,14 +347,19 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
             for slot in slots[:8]
         ]
 
-        # Lightweight prioritization: move ISO times containing preferred_time to the top.
-        preferred = preferred_time.strip().lower()
-        if preferred:
+        # Timezone-aware preferred time matching:
+        # Convert the user's natural-language preference (e.g. "7 pm") from
+        # their local timezone to a UTC time fragment (e.g. "13:00") so it
+        # can be matched against ISO timestamps in the payload.
+        # Previously this was a raw string search that never matched anything
+        # because "7 pm" never appears in "2026-04-16T13:00:00Z".
+        preferred_utc = _preferred_time_to_utc_fragment(preferred_time, user_timezone)
+        if preferred_utc:
             payload.sort(
-                key=lambda item: 0 if preferred in item["start_time"].lower() else 1
+                key=lambda item: 0 if preferred_utc in item["start_time"] else 1
             )
 
-        return _format_slots_for_tool(payload)
+        return _format_slots_for_tool(payload, user_timezone=user_timezone)
 
     @tool(
         "get_slot_booking_link",

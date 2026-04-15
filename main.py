@@ -13,7 +13,10 @@ from routers import (
     appointments_router,
     user_profile_router,
     lead_router,
+    widget_settings,
+    upload_router,
 )
+from routers.chat_router import widget_router
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -47,8 +50,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
+        "http://localhost:5173",
         "https://chatbotv2-dashboard.vercel.app",
-        "https://api.bayshorecommunication.com"
+        "https://api.bayshorecommunication.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -63,6 +67,9 @@ app.include_router(knowledge_router.router, prefix="/api/v1")
 app.include_router(appointments_router.router, prefix="/api")
 app.include_router(user_profile_router.router, prefix="/api")
 app.include_router(lead_router.router, prefix="/api/v1")
+app.include_router(widget_settings.router, prefix="/api/v1")
+app.include_router(upload_router.router,   prefix="/api/v1")
+app.include_router(widget_router,          prefix="/api")
 
 
 @app.get("/", tags=["Health"])

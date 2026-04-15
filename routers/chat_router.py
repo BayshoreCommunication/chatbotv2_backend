@@ -14,7 +14,8 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query, status
+from bson import ObjectId
+from fastapi import APIRouter, Header, HTTPException, Query, status
 from pydantic import BaseModel
 
 from database import get_database
@@ -33,6 +34,7 @@ from services.chatbot.session_cache import (
 from services.chatbot.tools import build_tools
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
+widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
 logger = logging.getLogger(__name__)
 
 
@@ -40,6 +42,7 @@ logger = logging.getLogger(__name__)
 
 class ChatRequest(BaseModel):
     session_id: str = "default"
+    visitor_id: str | None = None
     message: str
     user_timezone: str | None = None
 
@@ -151,12 +154,23 @@ async def chat(company_id: str, payload: ChatRequest):
         "chat.agent.ready company_id=%s elapsed_ms=%d", company_id, elapsed_agent
     )
 
-    # ── Load lead state: session cache first, MongoDB fallback on first message ──
+    # ── Session: track for cache TTL + visitor lead restore ──────────────────
     thread_id = f"{company_id}:{payload.session_id}"
     session = get_session(thread_id)
     if session is None:
-        # First message (or session expired) — load from MongoDB then cache
         db_lead = await _get_session_lead_state(company_id, payload.session_id)
+
+        # Returning visitor: carry forward contact info from a previous session
+        # so the LLM is not asking for details it already has in MongoDB.
+        if not db_lead.get("lead_captured") and payload.visitor_id:
+            visitor_lead = await _get_visitor_lead_state(company_id, payload.visitor_id)
+            if visitor_lead and visitor_lead.get("lead_captured"):
+                db_lead = visitor_lead
+                logger.info(
+                    "chat.visitor.lead_restored company_id=%s visitor_id=%s session_id=%s",
+                    company_id, payload.visitor_id, payload.session_id,
+                )
+
         session = await create_or_refresh_session(
             thread_id=thread_id,
             company_id=company_id,
@@ -165,131 +179,35 @@ async def chat(company_id: str, payload: ChatRequest):
             user_timezone=(payload.user_timezone or "").strip() or None,
         )
     else:
-        # Session alive — refresh timezone if newly provided
         if payload.user_timezone and not session.user_timezone:
             session.user_timezone = (payload.user_timezone or "").strip() or None
 
-    session_lead = session.to_lead_dict()
-    message_lead = await extract_lead_info_async(payload.message)
-    effective_lead_name = message_lead.name or session_lead["lead_name"]
-    effective_lead_phone = message_lead.phone or session_lead["lead_phone"]
-    effective_lead_email = message_lead.email or session_lead["lead_email"]
-    # A name alone is NOT enough — we need at least a phone or email to reach the user.
-    # Only suppress the intake flow once we have a real contact method.
-    lead_captured_effective = bool(
-        session_lead["lead_captured"]
-        or effective_lead_phone
-        or effective_lead_email
-    )
-    short_circuit_lead_reply = _build_post_lead_capture_reply_if_needed(
-        message=payload.message,
-        session_lead_captured=bool(session_lead["lead_captured"]),
-        message_lead=message_lead,
-        effective_lead_name=effective_lead_name,
-        effective_lead_phone=effective_lead_phone,
-        effective_lead_email=effective_lead_email,
-    )
-
-    if short_circuit_lead_reply:
-        reply = short_circuit_lead_reply
-        tools_used: list[str] = []
-        elapsed_total = int((time.monotonic() - t_start) * 1000)
-        logger.info(
-            "chat.response.short_circuit company_id=%s session_id=%s reason=lead_capture "
-            "reply_len=%d total_ms=%d",
-            company_id, payload.session_id, len(reply), elapsed_total,
-        )
-        # Update session cache immediately so next message sees the lead info
-        update_session_lead(
-            thread_id=thread_id,
-            name=effective_lead_name,
-            phone=effective_lead_phone,
-            email=effective_lead_email,
-        )
-        await _persist_exchange(
-            company_id=company_id,
-            session_id=payload.session_id,
-            user_message=payload.message,
-            ai_reply=reply,
-            tools_used=tools_used,
-            lead_info=message_lead,
-        )
-        return ChatResponse(
-            reply=reply,
-            session_id=payload.session_id,
-            company_id=company_id,
-            tools_used=tools_used,
-        )
-
-    # ── Invoke agent — LangGraph uses thread_id for per-session memory ────────
-    # thread_id is already set above (session cache lookup)
+    # ── Invoke agent — LLM is in full control ────────────────────────────────
+    # Router passes ONLY the user's timezone — the one piece of context the LLM
+    # cannot infer from conversation history.  Everything else (lead capture,
+    # tool selection, appointment flow) is the LLM's responsibility via its
+    # system prompt and the tools available to it.
     config = {"configurable": {"thread_id": thread_id}}
     register_thread_activity(thread_id)
-    available_tools = get_cached_tool_names(company_id)
 
     logger.info(
         "chat.agent.invoke company_id=%s session_id=%s thread_id=%s",
         company_id, payload.session_id, thread_id,
     )
 
+    user_timezone = (payload.user_timezone or "").strip()
+    input_messages: list[tuple[str, str]] = []
+    if user_timezone:
+        input_messages.append((
+            "system",
+            f"User timezone: {user_timezone} (auto-detected). "
+            "Use this for all scheduling and slot display. "
+            "Do not ask for timezone unless the user explicitly requests a change.",
+        ))
+    input_messages.append(("user", payload.message))
+
     t_invoke = time.monotonic()
     try:
-        input_messages: list[tuple[str, str]] = []
-        if lead_captured_effective:
-            # We have a real contact method (phone or email) — suppress re-asking.
-            input_messages.append(
-                (
-                    "system",
-                    (
-                        "Session lead state: contact details are already captured for this conversation. "
-                        f"Known name={effective_lead_name or 'unknown'}, "
-                        f"phone={effective_lead_phone or 'missing'}, "
-                        f"email={effective_lead_email or 'missing'}. "
-                        "STRICT RULES — follow all of these:\n"
-                        "1. Do NOT restart the contact intake flow. Do NOT ask for name, phone, or email again.\n"
-                        "2. Do NOT present the 'phone call / email / schedule now' options again — that decision was already made.\n"
-                        "3. If the user says 'yes' or agrees to 'connect with an attorney' or 'speak with the team' "
-                        "at any point after the lead is captured, do NOT ask 'Would you prefer a phone call or to schedule?'. "
-                        "Instead say: 'I already have your details — I will make sure our team reaches out to you shortly. "
-                        "Is there anything else I can help you with while you wait?'\n"
-                        "4. If user asks when the attorney/team will call: state simply that the intake team will reach out shortly to assist them.\n"
-                        "   Do NOT state any specific timeframes like 15-30 minutes or next business day.\n"
-                        "5. If the user replies 'yes' to a question like 'Is there anything about X you would like to know?', "
-                        "do NOT ask 'What specific questions do you have about X?' — answer X directly and helpfully right away.\n"
-                        "6. Always end with one specific follow-up question to keep the conversation going."
-                    ),
-                )
-            )
-        elif effective_lead_name and not effective_lead_phone and not effective_lead_email:
-            # We have the user's name but no contact method yet — remind the agent
-            # to acknowledge the name and ask specifically for phone or email.
-            input_messages.append(
-                (
-                    "system",
-                    (
-                        f"The user has shared their name: {effective_lead_name}. "
-                        "You do NOT yet have a phone number or email address for this person. "
-                        "STRICT RULE: Acknowledge their name warmly, then ask specifically for "
-                        "their best phone number (or email) so the team can follow up. "
-                        "Do NOT say 'I already have your details' — you only have a name, not a contact method."
-                    ),
-                )
-            )
-        input_messages.append(("system", _build_tool_order_instruction(available_tools)))
-        user_timezone = (payload.user_timezone or "").strip()
-        if user_timezone:
-            input_messages.append(
-                (
-                    "system",
-                    (
-                        f"User timezone is {user_timezone}. This timezone is auto-detected. "
-                        "Do not ask for timezone unless the user explicitly asks to change it. "
-                        "Use this timezone by default for scheduling and slot suggestions."
-                    ),
-                )
-            )
-        input_messages.append(("user", payload.message))
-
         result = await agent.ainvoke(
             {"messages": input_messages},
             config=config,
@@ -319,82 +237,11 @@ async def chat(company_id: str, payload: ChatRequest):
 
     # ── Collect which tools were actually called this turn ────────────────────
     tools_used: list[str] = []
-    tool_outputs: list[str] = []
     for msg in turn_messages:
         if getattr(msg, "type", "") == "tool":
             name = getattr(msg, "name", "")
             if name and name not in tools_used:
                 tools_used.append(name)
-            tool_outputs.append(str(getattr(msg, "content", "")))
-
-    has_fact_tools = any(
-        tool_name in available_tools for tool_name in ("knowledge_base", "web_search", "wikipedia")
-    )
-    if _is_information_request(payload.message) and not tools_used and has_fact_tools:
-        logger.info(
-            "chat.agent.retry_tool_enforced company_id=%s session_id=%s reason=no_tools_used_first_pass",
-            company_id,
-            payload.session_id,
-        )
-        # Keep same thread so retry has full conversation memory.
-        retry_config = {"configurable": {"thread_id": thread_id}}
-        retry_messages = [
-            (
-                "system",
-                _build_tool_order_instruction(available_tools),
-            ),
-            ("user", payload.message),
-        ]
-        try:
-            retry_result = await agent.ainvoke(
-                {"messages": retry_messages},
-                config=retry_config,
-            )
-            retry_all = retry_result.get("messages", [])
-            retry_turn = _slice_current_turn_messages(retry_all, payload.message)
-
-            retry_reply = ""
-            for msg in reversed(retry_turn):
-                if hasattr(msg, "content") and getattr(msg, "type", "") == "ai":
-                    retry_reply = msg.content
-                    break
-            if not retry_reply and retry_turn:
-                retry_reply = str(retry_turn[-1].content)
-
-            retry_tools_used: list[str] = []
-            retry_tool_outputs: list[str] = []
-            for msg in retry_turn:
-                if getattr(msg, "type", "") == "tool":
-                    name = getattr(msg, "name", "")
-                    if name and name not in retry_tools_used:
-                        retry_tools_used.append(name)
-                    retry_tool_outputs.append(str(getattr(msg, "content", "")))
-
-            if retry_reply:
-                reply = retry_reply
-            if retry_tools_used:
-                tools_used = retry_tools_used
-            if retry_tool_outputs:
-                tool_outputs = retry_tool_outputs
-        except Exception as exc:
-            logger.warning(
-                "chat.agent.retry_tool_enforced_failed company_id=%s session_id=%s error=%s",
-                company_id,
-                payload.session_id,
-                exc,
-            )
-
-    if _tool_outputs_insufficient(tool_outputs) and not _reply_acknowledges_uncertainty(reply):
-        reply = (
-            "I checked my sources but I still don't have enough verified information to answer that confidently right now. "
-            "If you want, I can take your details and have our team follow up with a precise answer."
-        )
-
-    if _is_callback_timing_question(payload.message):
-        reply = _build_callback_timing_reply(
-            lead_name=effective_lead_name,
-            lead_phone=effective_lead_phone,
-        )
 
     elapsed_total = int((time.monotonic() - t_start) * 1000)
     logger.info(
@@ -404,18 +251,21 @@ async def chat(company_id: str, payload: ChatRequest):
         tools_used, elapsed_invoke, elapsed_total,
     )
 
-    # ── Update session cache immediately (before persist) ────────────────────
-    # This ensures the NEXT message sees lead info even if _persist_exchange
-    # hasn't finished yet — fixing the race condition that caused re-asking.
+    # ── Side-effect: extract lead info, update cache, persist ────────────────
+    # Happens AFTER the LLM reply — does NOT influence the response content.
+    if _looks_like_contact_share_message(payload.message):
+        message_lead = await extract_lead_info_async(payload.message)
+    else:
+        message_lead = LeadInfo()
+
     if message_lead.has_any:
         update_session_lead(
             thread_id=thread_id,
-            name=effective_lead_name,
-            phone=effective_lead_phone,
-            email=effective_lead_email,
+            name=message_lead.name,
+            phone=message_lead.phone,
+            email=message_lead.email,
         )
 
-    # ── Persist exchange to MongoDB chat_sessions ─────────────────────────────
     await _persist_exchange(
         company_id=company_id,
         session_id=payload.session_id,
@@ -423,6 +273,7 @@ async def chat(company_id: str, payload: ChatRequest):
         ai_reply=reply,
         tools_used=tools_used,
         lead_info=message_lead,
+        visitor_id=payload.visitor_id,
     )
 
     return ChatResponse(
@@ -575,6 +426,7 @@ async def _persist_exchange(
     ai_reply: str,
     tools_used: list[str],
     lead_info: LeadInfo | None = None,
+    visitor_id: str | None = None,
 ) -> None:
     """
     Upsert this chat exchange into the `chat_sessions` MongoDB collection.
@@ -597,20 +449,26 @@ async def _persist_exchange(
 
         # ── 2. Build the $set payload ─────────────────────────────────────────
         set_fields: dict = {"updated_at": now}
+        if visitor_id:
+            set_fields["visitor_id"] = visitor_id
 
         if lead_info.has_any:
-            set_fields["lead_captured"] = True
             if lead_info.name:
                 set_fields["lead_name"]  = lead_info.name
             if lead_info.phone:
                 set_fields["lead_phone"] = lead_info.phone
             if lead_info.email:
                 set_fields["lead_email"] = lead_info.email
+            # A name alone is NOT enough — only flag lead_captured once we have
+            # a real contact method (phone or email) that lets the team reach out.
+            if lead_info.phone or lead_info.email:
+                set_fields["lead_captured"] = True
 
             logger.debug(
                 "chat.lead.detected company_id=%s session_id=%s "
-                "name=%r phone=%r email=%r",
+                "lead_captured=%s name=%r phone=%r email=%r",
                 company_id, session_id,
+                bool(lead_info.phone or lead_info.email),
                 _mask_value(lead_info.name),
                 _mask_value(lead_info.phone),
                 _mask_value(lead_info.email),
@@ -633,12 +491,10 @@ async def _persist_exchange(
                 "$inc":  {"exchange_count": 1},
                 "$set":  set_fields,
                 "$setOnInsert": {
-                    # IMPORTANT: do NOT put lead_captured here.
+                    # IMPORTANT: do NOT duplicate fields that appear in $set.
                     # MongoDB forbids the same field path in both $set and
-                    # $setOnInsert. When lead info arrives on the very first
-                    # message of a new session, $set sets lead_captured=True
-                    # while $setOnInsert had lead_captured=False — MongoDB
-                    # raises a silent WriteError and the ENTIRE write fails.
+                    # $setOnInsert — it raises a WriteError and the ENTIRE
+                    # write fails. visitor_id is already handled in $set above.
                     "company_id":  company_id,
                     "session_id":  session_id,
                     "created_at":  now,
@@ -654,8 +510,10 @@ async def _persist_exchange(
             op, company_id, session_id, tools_used,
         )
 
-        # ── 5. Upsert into the `leads` collection if contact info was found ───
-        if lead_info.has_any:
+        # ── 5. Upsert into the `leads` collection only when a contact method exists ─
+        # A name alone is not actionable — only write to `leads` once we have
+        # phone or email so the dashboard doesn't show incomplete lead records.
+        if lead_info.has_any and (lead_info.phone or lead_info.email):
             lead_set: dict = {"updated_at": now}
             if lead_info.name:
                 lead_set["name"]  = lead_info.name
@@ -721,30 +579,76 @@ def _mask_value(value: str | None, keep_tail: int = 2) -> str:
 
 
 def _build_tool_order_instruction(available_tools: list[str]) -> str:
-    ordered_tools = [
-        tool_name
-        for tool_name in ("knowledge_base", "web_search", "wikipedia")
-        if tool_name in available_tools
+    """
+    Build a per-turn system instruction telling the LLM exactly which tools
+    to call and in what order.  Covers both fact-retrieval tools and appointment
+    scheduling tools so the agent never skips a mandatory tool call.
+    """
+    fact_tools = [
+        t for t in ("knowledge_base", "web_search", "wikipedia")
+        if t in available_tools
     ]
-    if not ordered_tools:
-        return (
-            "No factual verification tools are currently available. "
-            "Do not invent facts, and clearly ask a focused follow-up question when uncertain."
+    appt_tools = [
+        t for t in ("check_appointment_setup", "get_available_appointment_slots", "get_slot_booking_link")
+        if t in available_tools
+    ]
+
+    parts: list[str] = []
+
+    if fact_tools:
+        steps = " -> ".join(fact_tools)
+        parts.append(
+            "FACT-RETRIEVAL TOOLS (mandatory for company/legal/factual questions):\n"
+            f"Required order: {steps}.\n"
+            "- Call knowledge_base FIRST for any company-specific question.\n"
+            "- If knowledge_base returns nothing useful, call web_search NEXT.\n"
+            "- Only say 'I don't have that verified' after trying ALL available fact tools.\n"
+            "- The user's lead-capture status does NOT exempt you from calling tools.\n"
+            "- EXCEPTION: Off-topic questions (politics, sports, trivia) — politely refuse."
+        )
+    else:
+        parts.append(
+            "No factual retrieval tools available. "
+            "Do not invent facts. Ask a focused follow-up question when uncertain."
         )
 
-    steps = " -> ".join(ordered_tools)
-    return (
-        "You must verify factual/company answers with available tools. "
-        f"Required order (only tools currently available): {steps}. "
-        "If one source is insufficient, continue to the next available source. "
-        "If all are insufficient, explicitly say information is not verified and do not guess. "
-        "CRITICAL EXCEPTION: If the question is completely OFF-TOPIC (e.g., politics, sports, trivia), "
-        "do not use tools and politely refuse."
-    )
+    if appt_tools:
+        parts.append(
+            "APPOINTMENT SCHEDULING TOOLS (mandatory when user gives a preferred time):\n"
+            "- When the user has chosen to schedule AND given a date/time preference, "
+            "you MUST call check_appointment_setup THEN get_available_appointment_slots immediately.\n"
+            "- Do NOT say 'I cannot confirm availability' or 'Would you like me to check?' — "
+            "just call the tools and show real results.\n"
+            "- Pass preferred_time exactly as the user stated (e.g. '3 pm', '14:00', 'morning').\n"
+            "- Pass user_timezone from the session context when available.\n"
+            "- After user picks a slot and gives name+email, call get_slot_booking_link "
+            "with the exact iso_start_time and share the confirmation page URL immediately.\n"
+            "- DATE RULE FOR SCHEDULING: When user says 'tomorrow' or a future date for an APPOINTMENT, "
+            "treat it as the literal next calendar day. This rule is for SCHEDULING ONLY.\n"
+            "  (The 'did you mean yesterday?' date check only applies when asking about the accident/incident date.)"
+        )
+
+    return "\n\n".join(parts)
 
 
 def _tool_outputs_insufficient(tool_outputs: list[str]) -> bool:
+    # BUG 2 FIX: Previously, empty strings (returned by knowledge_base when no
+    # docs are found) were filtered via `if out`, leaving only the web_search
+    # result.  If that web result's body happened to contain a failure-marker
+    # substring (e.g. "no longer available" in a quoted news headline), ALL
+    # remaining outputs were flagged and the good web_search reply was silently
+    # discarded and replaced with the generic fallback string.
+    #
+    # Correct logic:
+    #   - Empty strings = KB found nothing (treat as "no result", not a failure).
+    #   - Only flag as insufficient when EVERY non-empty output explicitly
+    #     signals a tool-level error, not just a substring coincidence.
+    #   - Exclude "missing" and "empty" as standalone markers — too broad.
     if not tool_outputs:
+        return False
+    non_empty = [out.strip() for out in tool_outputs if out and out.strip()]
+    if not non_empty:
+        # All outputs were empty (KB returned no docs) — let the reply stand.
         return False
     markers = (
         "no available",
@@ -752,15 +656,10 @@ def _tool_outputs_insufficient(tool_outputs: list[str]) -> bool:
         "not found",
         "cannot fetch",
         "could not fetch",
-        "missing",
         "not configured",
         "no longer available",
-        "empty",
     )
-    lowered = [out.lower() for out in tool_outputs if out]
-    if not lowered:
-        return False
-    return all(any(marker in out for marker in markers) for out in lowered)
+    return all(any(marker in out.lower() for marker in markers) for out in non_empty)
 
 
 def _reply_acknowledges_uncertainty(reply: str) -> bool:
@@ -795,8 +694,54 @@ def _is_information_request(message: str) -> bool:
         "address", "email", "phone", "contact", "office",
         "price", "cost", "fee", "hours", "service", "policy",
         "details", "information", "compensation", "claim", "process",
+        "experience", "attorney", "lawyer", "years", "how long",
+        "team", "staff", "partner", "founder", "practice",
+        "location", "area", "state", "handle", "speciali",
+        "win rate", "success", "settlement", "case",
     )
     return any(k in text for k in keywords) or "?" in text
+
+
+def _is_scheduling_time_response(message: str) -> bool:
+    """
+    Return True when the user's message looks like a time/date preference
+    response to a scheduling question (e.g. '3 pm', 'tomorrow at 10', 'morning').
+    Used to trigger a retry that forces the agent to call appointment tools
+    instead of answering from memory.
+    """
+    import re
+    text = (message or "").strip().lower()
+    if not text or len(text) > 80:  # long messages are unlikely to be bare time responses
+        return False
+
+    # Tiny non-scheduling words to skip
+    tiny = {"ok", "okay", "yes", "no", "sure", "hi", "hello", "thanks", "thank you"}
+    if text in tiny:
+        return False
+
+    # Explicit time-of-day markers
+    time_keywords = ("am", "pm", "morning", "afternoon", "evening", "noon", "midnight", "o'clock")
+    if any(k in text for k in time_keywords):
+        return True
+
+    # HH:MM pattern
+    if re.search(r"\b\d{1,2}:\d{2}\b", text):
+        return True
+
+    # Bare digit that looks like an hour (e.g. "7", "14")
+    if re.fullmatch(r"\d{1,2}", text.strip()):
+        return True
+
+    # Date/day words in a short message (strongly scheduling context)
+    schedule_words = (
+        "tomorrow", "today", "monday", "tuesday", "wednesday",
+        "thursday", "friday", "saturday", "sunday",
+        "next week", "this week", "next monday",
+    )
+    if any(k in text for k in schedule_words):
+        return True
+
+    return False
 
 
 async def _get_session_lead_state(company_id: str, session_id: str) -> dict[str, str | bool | None]:
@@ -824,6 +769,32 @@ async def _get_session_lead_state(company_id: str, session_id: str) -> dict[str,
         "lead_name": doc.get("lead_name"),
         "lead_phone": doc.get("lead_phone"),
         "lead_email": doc.get("lead_email"),
+    }
+
+
+async def _get_visitor_lead_state(company_id: str, visitor_id: str) -> dict[str, str | bool | None] | None:
+    """Return lead info from the visitor's most recent session that captured a contact.
+    Used to avoid re-asking returning visitors for their name / phone / email.
+    """
+    db = get_database()
+    doc = await db["chat_sessions"].find_one(
+        {"company_id": company_id, "visitor_id": visitor_id, "lead_captured": True},
+        {
+            "_id": 0,
+            "lead_captured": 1,
+            "lead_name": 1,
+            "lead_phone": 1,
+            "lead_email": 1,
+        },
+        sort=[("updated_at", -1)],
+    )
+    if not doc:
+        return None
+    return {
+        "lead_captured": bool(doc.get("lead_captured", False)),
+        "lead_name":     doc.get("lead_name"),
+        "lead_phone":    doc.get("lead_phone"),
+        "lead_email":    doc.get("lead_email"),
     }
 
 
@@ -868,7 +839,15 @@ def _build_post_lead_capture_reply_if_needed(
     effective_lead_email: str | None,
 ) -> str | None:
     """
-    Deterministic guard: if user shares contact details, do not let the LLM restart intake.
+    Deterministic guard: if user shares PHONE contact details, do not let the
+    LLM restart the intake flow.
+
+    IMPORTANT — Email is intentionally excluded from triggering this short-circuit.
+    Reason: an email address is legitimately required mid-flow for Calendly
+    appointment confirmation (the agent asks for name + email to book a slot).
+    If we short-circuit on email, we bypass the agent before it can call
+    `get_slot_booking_link` and the appointment confirmation URL is never sent.
+    Phone numbers are unambiguously lead-capture, so we still guard on those.
     """
     if session_lead_captured:
         return None
@@ -877,6 +856,8 @@ def _build_post_lead_capture_reply_if_needed(
     if not _looks_like_contact_share_message(message):
         return None
 
+    # Only short-circuit when the user shares a phone number.
+    # Email alone → let the agent decide (could be appointment booking).
     if effective_lead_phone:
         name_part = f", {effective_lead_name}" if effective_lead_name else ""
         return (
@@ -884,17 +865,107 @@ def _build_post_lead_capture_reply_if_needed(
             "Is there anything else you'd like to share about your situation before we connect?"
         )
 
-    if effective_lead_email:
-        name_part = f", {effective_lead_name}" if effective_lead_name else ""
-        return (
-            f"Thanks{name_part}. I have your details and our intake team will follow up for your free review by email. "
-            "Would you like a callback instead, or should we continue by email?"
-        )
+    # Email only — do NOT short-circuit. Return None so the agent handles it.
+    # This allows the agent to proceed with `get_slot_booking_link` when the
+    # user is in the middle of scheduling an appointment.
+    if effective_lead_email and not effective_lead_phone:
+        return None
 
+    # Name only (no phone, no email) — gently ask for a contact method.
     return (
-        "Thanks. I have your name. Please share your best phone number so our intake team can call you "
-        "for your free case review."
+        "Thanks. I have your name. Can I get your best phone number so our intake team can call you "
+        "for your free case review?"
     )
+
+
+# ── Public widget endpoint ────────────────────────────────────────────────────
+
+class WidgetChatRequest(BaseModel):
+    message: str
+    history: list = []
+
+
+class WidgetChatResponse(BaseModel):
+    answer: str
+    session_id: str
+    company_id: str
+
+
+@widget_router.post("/ask", response_model=WidgetChatResponse, summary="Widget public chat")
+async def widget_ask(
+    payload: WidgetChatRequest,
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_visitor_id: str | None = Header(default=None, alias="X-Visitor-ID"),
+    x_session_id: str | None = Header(default=None, alias="X-Session-ID"),
+):
+    """
+    Public endpoint used by the embedded widget script.
+    - `X-API-Key`    — format: org-<company_id>
+    - `X-Session-ID` — visitor session string (used for conversation memory)
+    """
+    if not x_api_key:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="X-API-Key header is required.")
+
+    if x_api_key.startswith("org-"):
+        company_id = x_api_key[4:]
+    else:
+        company_id = x_api_key
+
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid API key format.")
+
+    session_id = (x_session_id or "default").strip() or "default"
+
+    chat_request = ChatRequest(
+        session_id=session_id,
+        visitor_id=(x_visitor_id or "").strip() or None,
+        message=payload.message,
+    )
+    chat_response = await chat(company_id, chat_request)
+
+    return WidgetChatResponse(
+        answer=chat_response.reply,
+        session_id=chat_response.session_id,
+        company_id=chat_response.company_id,
+    )
+
+
+@widget_router.get("/history", summary="Widget session history")
+async def widget_history(
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+    x_session_id: str | None = Header(default=None, alias="X-Session-ID"),
+):
+    """
+    Return all messages for the current widget session so the widget
+    can restore conversation history on page reload.
+    - `X-API-Key`    — format: org-<company_id>
+    - `X-Session-ID` — session string
+    """
+    if not x_api_key:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="X-API-Key header is required.")
+
+    company_id = x_api_key[4:] if x_api_key.startswith("org-") else x_api_key
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid API key format.")
+
+    session_id = (x_session_id or "").strip()
+    if not session_id:
+        return {"messages": []}
+
+    db = get_database()
+    doc = await db["chat_sessions"].find_one(
+        {"company_id": company_id, "session_id": session_id},
+        {"_id": 0, "messages": 1},
+    )
+    if not doc:
+        return {"messages": []}
+
+    messages = [
+        {"role": msg.get("role", ""), "text": msg.get("content", "")}
+        for msg in doc.get("messages", [])
+        if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
+    ]
+    return {"messages": messages}
 
 
 def _looks_like_contact_share_message(message: str) -> bool:

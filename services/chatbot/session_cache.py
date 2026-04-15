@@ -213,22 +213,31 @@ def update_session_lead(
         return False
 
     updated = False
-    if name and not session.lead_name:
-        session.lead_name = name
-        updated = True
-    if phone and not session.lead_phone:
-        session.lead_phone = phone
-        updated = True
-    if email and not session.lead_email:
-        session.lead_email = email
-        updated = True
+    # Allow overwriting so a user can correct a previously given value
+    # (e.g., they mistyped their phone number and re-send the correct one).
+    if name:
+        if session.lead_name != name:
+            session.lead_name = name
+            updated = True
+    if phone:
+        if session.lead_phone != phone:
+            session.lead_phone = phone
+            updated = True
+    if email:
+        if session.lead_email != email:
+            session.lead_email = email
+            updated = True
 
     if updated:
-        session.lead_captured = True
+        # A name alone is NOT enough — only mark lead_captured once we have
+        # a real contact method (phone or email) that lets the team reach out.
+        if session.lead_phone or session.lead_email:
+            session.lead_captured = True
         session.touch()
         logger.debug(
-            "session_cache.lead_updated thread_id=%s name=%r phone=%r email=%r",
+            "session_cache.lead_updated thread_id=%s lead_captured=%s name=%r phone=%r email=%r",
             thread_id,
+            session.lead_captured,
             _mask_value(session.lead_name),
             _mask_value(session.lead_phone),
             _mask_value(session.lead_email),

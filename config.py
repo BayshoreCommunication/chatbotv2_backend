@@ -31,5 +31,14 @@ class Settings(BaseSettings):
     # ── Calendly ──────────────────────────────────────────────────────────────
     CALENDLY_API_KEY: str
 
+    # ── DigitalOcean Spaces ───────────────────────────────────────────────────
+    DO_SPACES_KEY: str
+    DO_SPACES_SECRET: str
+    DO_SPACES_ENDPOINT: str
+    DO_SPACES_BUCKET: str
+    DO_SPACES_REGION: str
+    DO_SPACES_CDN_URL: str
+    DO_FOLDER_NAME: str = "uploads"
+
 
 settings = Settings()
