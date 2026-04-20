@@ -64,7 +64,7 @@ async def dashboard_chart(
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
 
 
-# ── GET /dashboard/{company_id}/visitors ──────────────────────────────────────
+# ── GET /dashboard/{company_id}/visitors ─────────────────────────────────────
 
 @router.get("/{company_id}/visitors", summary="Unique visitor statistics")
 async def dashboard_visitors(company_id: str):
