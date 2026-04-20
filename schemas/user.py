@@ -2,7 +2,7 @@ from typing import Optional, Literal
 from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field, HttpUrl
 
-SubscriptionType = Literal["free", "pro", "enterprise"]
+SubscriptionType = Literal["free", "starter", "professional", "enterprise"]
 CompanyType = Literal[
     "tech-company",
     "law-firm",
@@ -73,6 +73,7 @@ class UserUpdate(BaseModel):
     role: Optional[str] = None
     is_active: Optional[bool] = None
     is_subscribed: Optional[bool] = None
+    has_paid_subscription: Optional[bool] = None
     subscription_type: Optional[SubscriptionType] = None
     subscription_start_date: Optional[datetime] = None
     subscription_end_date: Optional[datetime] = None
@@ -92,6 +93,7 @@ class UserResponse(BaseModel):
     is_active: bool
     is_verified: bool
     is_subscribed: bool
+    has_paid_subscription: bool = False
     subscription_type: str
     subscription_start_date: Optional[datetime]
     subscription_end_date: Optional[datetime]

@@ -27,6 +27,7 @@ def serialize_user(user: dict) -> dict:
         "is_active": user.get("is_active", True),
         "is_verified": user.get("is_verified", False),
         "is_subscribed": user.get("is_subscribed", False),
+        "has_paid_subscription": user.get("has_paid_subscription", False),
         "subscription_type": user.get("subscription_type", "free"),
         "subscription_start_date": user.get("subscription_start_date"),
         "subscription_end_date": user.get("subscription_end_date"),

@@ -30,6 +30,86 @@ from .store      import entries_to_documents, upsert_to_pinecone
 
 logger = logging.getLogger(__name__)
 
+# ── Required info checks ──────────────────────────────────────────────────────
+
+_REQUIRED_CHECKS = [
+    {
+        "key": "company_overview",
+        "label": "Company Overview (Home Page)",
+        "categories": {"overview"},
+        "keywords": [],
+    },
+    {
+        "key": "about_details",
+        "label": "About / Company Details",
+        "categories": {"team", "about"},
+        "keywords": ["founded", "mission", "vision", "history", "about us", "our story"],
+    },
+    {
+        "key": "services",
+        "label": "Services / Products",
+        "categories": {"services", "products"},
+        "keywords": ["service", "product", "offer", "provide", "solution"],
+    },
+    {
+        "key": "contact_phone",
+        "label": "Contact Phone Number",
+        "categories": {"contact"},
+        "keywords": ["phone", "mobile", "call", "tel", "+", "("],
+    },
+    {
+        "key": "contact_email",
+        "label": "Contact Email Address",
+        "categories": {"contact"},
+        "keywords": ["@", "email", "mail"],
+    },
+    {
+        "key": "office_address",
+        "label": "Office Address",
+        "categories": {"contact", "location"},
+        "keywords": ["address", "street", "ave", "road", "blvd", "suite", "floor", "city", "state", "zip"],
+    },
+    {
+        "key": "office_hours",
+        "label": "Office / Business Hours",
+        "categories": {"contact", "hours"},
+        "keywords": ["hours", "monday", "tuesday", "open", "closed", "am", "pm", "9-5", "9 am", "5 pm"],
+    },
+]
+
+
+def check_required_info(entries: list[dict]) -> list[dict]:
+    """
+    Inspect extracted knowledge entries and return a list of important
+    info items that appear to be missing.
+
+    Each missing item: {"key": str, "label": str}
+    """
+    missing = []
+    for check in _REQUIRED_CHECKS:
+        found = False
+        for entry in entries:
+            cat = (entry.get("category") or "").lower()
+            content = (entry.get("content") or "").lower()
+            topic = (entry.get("topic") or "").lower()
+            combined = content + " " + topic
+
+            # Match by category
+            if cat in check["categories"]:
+                # If no keywords required, category match is enough
+                if not check["keywords"]:
+                    found = True
+                    break
+                # Otherwise require at least one keyword in content/topic
+                if any(kw in combined for kw in check["keywords"]):
+                    found = True
+                    break
+
+        if not found:
+            missing.append({"key": check["key"], "label": check["label"]})
+
+    return missing
+
 
 async def train_company(
     company_id: str,
@@ -41,7 +121,7 @@ async def train_company(
     Full LLM-powered knowledge base training pipeline.
 
     Steps:
-      1. Crawl the company website (up to 30 pages)
+      1. Crawl the company website (up to 50 pages)
       2. Run DuckDuckGo web searches for company enrichment
       3. LLM extracts ONLY useful, structured facts from all raw content
       4. Embed facts + upsert into Pinecone (namespace = company_id)
@@ -164,11 +244,15 @@ async def train_company(
         logger.info("knowledgebase.step=4 skipped because knowledge_entries is empty.")
 
     # ── Step 5: Quality score ─────────────────────────────────────────────────
+    categories = list({e.get("category", "") for e in knowledge_entries if e.get("category")})
+
+    missing_info = check_required_info(knowledge_entries)
+
     quality_score = calculate_quality_score(
         entries=knowledge_entries,
         pages_crawled=len(crawled_pages),
+        missing_info=missing_info,
     )
-    categories = list({e.get("category", "") for e in knowledge_entries if e.get("category")})
 
     result = {
         "entries_stored":  entries_stored,
@@ -179,7 +263,8 @@ async def train_company(
         "namespace":       company_id,
         "last_updated":    datetime.now(timezone.utc),
         "categories":      sorted(categories),
-        "knowledge_entries": knowledge_entries,   # full list of extracted facts
+        "knowledge_entries": knowledge_entries,
+        "missing_info":    missing_info,
     }
     logger.info(
         "knowledgebase.train.complete company_id=%s score=%.1f entries=%d categories=%s",

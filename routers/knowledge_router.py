@@ -14,13 +14,14 @@ from datetime import datetime, timezone
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, status, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl
 
 from database import get_database
 from services.knowledgebase import train_company
+from services.knowledgebase.store import entries_to_documents, upsert_to_pinecone
 from services.chatbot import invalidate_company_agent
 from services.chatbot.company_context import invalidate_context
-from model.knowledge_model import TrainResult as TrainResultModel, KnowledgeBaseDocument, TrainRunHistory
+from model.knowledge_model import TrainResult as TrainResultModel, KnowledgeBaseDocument, KnowledgeEntry, TrainRunHistory, MissingInfoItem
 
 router = APIRouter(prefix="/knowledge", tags=["Knowledge Base"])
 logger = logging.getLogger(__name__)
@@ -38,13 +39,30 @@ class TrainResponse(BaseModel):
     message: str
     company_id: str
     pages_crawled: int
-    search_results: int          # web search snippets evaluated by LLM
-    entries_stored: int          # LLM-approved facts stored in Pinecone
-    quality_score: float         # 0–100
-    categories: list[str]        # knowledge categories extracted
+    search_results: int
+    entries_stored: int
+    quality_score: float
+    categories: list[str]
     vector_store_id: str
     namespace: str
     last_updated: datetime
+    missing_info: list[MissingInfoItem] = Field(default_factory=list)
+
+
+class FillMissingItem(BaseModel):
+    key:      str   # matches MissingInfoItem.key  e.g. "contact_phone"
+    label:    str   # human label                  e.g. "Contact Phone Number"
+    content:  str   # the actual value the user typed
+
+
+class FillMissingRequest(BaseModel):
+    items: list[FillMissingItem]
+
+
+class FillMissingResponse(BaseModel):
+    message:        str
+    entries_added:  int
+    remaining_missing: list[MissingInfoItem]
 
 
 class TrainStatusResponse(BaseModel):
@@ -190,6 +208,7 @@ async def train(
         namespace=result.namespace,
         last_updated=result.last_updated,
         entries=[e for e in result.knowledge_entries],
+        missing_info=result.missing_info,
     )
     await db["knowledge_base"].update_one(
         {"company_id": company_id},
@@ -240,6 +259,7 @@ async def train(
         vector_store_id=result.vector_store_id,
         namespace=result.namespace,
         last_updated=result.last_updated,
+        missing_info=result.missing_info,
     )
 
 
@@ -271,4 +291,159 @@ async def get_status(
         update_limit=td.get("update_limit", 10),
         vector_store_id=company.get("vector_store_id"),
         namespace=td.get("namespace"),
+    )
+
+
+# ── GET /knowledge/missing-info/{company_id} ─────────────────────────────────
+
+@router.get(
+    "/missing-info/{company_id}",
+    summary="Get current missing required info items for a company",
+)
+async def get_missing_info(
+    company_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    """Returns the missing_info list from the knowledge_base document."""
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid company ID.")
+    kb_doc = await db["knowledge_base"].find_one(
+        {"company_id": company_id},
+        {"_id": 0, "missing_info": 1},
+    )
+    missing = [MissingInfoItem(**m) for m in (kb_doc or {}).get("missing_info", [])]
+    return {"missing_info": [m.model_dump() for m in missing]}
+
+
+# ── POST /knowledge/fill-missing/{company_id} ────────────────────────────────
+
+@router.post(
+    "/fill-missing/{company_id}",
+    response_model=FillMissingResponse,
+    summary="Fill in missing required info and store in Pinecone + MongoDB",
+)
+async def fill_missing_info(
+    company_id: str,
+    payload: FillMissingRequest,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    """
+    Accepts user-provided values for missing required info items (e.g. phone,
+    office hours, address).  Each item is:
+      1. Embedded and upserted into Pinecone (same namespace = company_id).
+      2. Added to the `entries` array in the `knowledge_base` MongoDB document.
+      3. Removed from the `missing_info` array so it no longer shows as missing.
+      4. Increments `entries_stored` on both `knowledge_base` and `users` docs.
+    """
+    company = await _get_company(db, company_id)
+
+    if not payload.items:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "No items provided.")
+
+    # Validate each item has content
+    for item in payload.items:
+        if not item.content.strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"Content is empty for key '{item.key}'.",
+            )
+
+    company_name = company.get("company_name", "")
+    company_type = company.get("company_type", "other")
+
+    # ── Build knowledge entries from user-provided data ───────────────────────
+    # Map missing_info key → sensible category
+    _KEY_TO_CATEGORY: dict[str, str] = {
+        "company_overview":  "overview",
+        "about_details":     "overview",
+        "services":          "services",
+        "contact_phone":     "contact",
+        "contact_email":     "contact",
+        "office_address":    "contact",
+        "office_hours":      "contact",
+    }
+
+    new_entries = []
+    for item in payload.items:
+        category = _KEY_TO_CATEGORY.get(item.key, "overview")
+        entry = KnowledgeEntry(
+            topic=item.label,
+            content=item.content.strip(),
+            category=category,
+            source_url="manual_input",
+        )
+        new_entries.append(entry)
+
+    # ── 1. Embed + upsert to Pinecone ─────────────────────────────────────────
+    documents = entries_to_documents(
+        entries=[e.model_dump() for e in new_entries],
+        company_id=company_id,
+        company_name=company_name,
+        company_type=company_type,
+    )
+    try:
+        stored = await upsert_to_pinecone(documents=documents, company_id=company_id)
+    except Exception as e:
+        logger.exception("fill_missing.pinecone_failed company_id=%s error=%s", company_id, e)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            f"Failed to store entries in vector store: {e}",
+        )
+
+    logger.info(
+        "fill_missing.pinecone.done company_id=%s entries_added=%d",
+        company_id, stored,
+    )
+
+    # ── 2. Update knowledge_base MongoDB document ─────────────────────────────
+    # Remove resolved keys from missing_info; append new entries
+    resolved_keys = {item.key for item in payload.items}
+    now = datetime.now(timezone.utc)
+
+    await db["knowledge_base"].update_one(
+        {"company_id": company_id},
+        {
+            "$pull": {
+                "missing_info": {"key": {"$in": list(resolved_keys)}},
+            },
+            "$push": {
+                "entries": {"$each": [e.model_dump() for e in new_entries]},
+            },
+            "$inc":  {"entries_stored": stored},
+            "$set":  {"last_updated": now},
+        },
+    )
+
+    # ── 3. Update entries_stored on the users document ────────────────────────
+    await db["users"].update_one(
+        {"_id": ObjectId(company_id)},
+        {
+            "$inc": {"train_data.entries_stored": stored},
+            "$set": {"updated_at": now},
+        },
+    )
+
+    logger.info(
+        "fill_missing.mongo.done company_id=%s entries_added=%d resolved_keys=%s",
+        company_id, stored, resolved_keys,
+    )
+
+    # ── 4. Evict caches so next chat picks up the new entries ─────────────────
+    invalidate_context(company_id)
+    invalidate_company_agent(company_id)
+
+    # Return updated missing_info list so the frontend can refresh the UI
+    kb_doc = await db["knowledge_base"].find_one(
+        {"company_id": company_id},
+        {"_id": 0, "missing_info": 1},
+    )
+    remaining = [
+        MissingInfoItem(**m)
+        for m in (kb_doc or {}).get("missing_info", [])
+    ]
+
+    return FillMissingResponse(
+        message=f"{stored} entr{'y' if stored == 1 else 'ies'} added to your knowledge base.",
+        entries_added=stored,
+        remaining_missing=remaining,
     )

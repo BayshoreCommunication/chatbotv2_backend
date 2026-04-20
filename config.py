@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     PINECONE_ENV: str
     PINECONE_INDEX: str
 
+    # ── Stripe ────────────────────────────────────────────────────────────────
+    PUBLISHABLE_KEY:        str = ""
+    STRIPE_SECRET_KEY:      str = ""
+    STRIPE_WEBHOOK_SECRET:  str = ""
+
     # ── Calendly ──────────────────────────────────────────────────────────────
     CALENDLY_API_KEY: str
 

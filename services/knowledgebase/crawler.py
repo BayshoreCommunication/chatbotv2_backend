@@ -15,9 +15,38 @@ from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
-MAX_PAGES       = 30
+MAX_PAGES       = 50
 MAX_DEPTH       = 3
 REQUEST_TIMEOUT = 15
+
+# Common high-value routes to attempt first regardless of site link structure
+PRIORITY_ROUTES = [
+    "/",
+    "/about",
+    "/about-us",
+    "/our-story",
+    "/company",
+    "/services",
+    "/service",
+    "/what-we-do",
+    "/solutions",
+    "/products",
+    "/portfolio",
+    "/work",
+    "/case-studies",
+    "/contact",
+    "/contact-us",
+    "/get-in-touch",
+    "/reach-us",
+    "/team",
+    "/our-team",
+    "/people",
+    "/pricing",
+    "/plans",
+    "/faq",
+    "/faqs",
+    "/blog",
+]
 
 
 def _same_domain(base: str, url: str) -> bool:
@@ -56,7 +85,19 @@ async def crawl_website(root_url: str) -> list[dict]:
     from bs4 import BeautifulSoup        # lazy import
 
     visited: set[str] = set()
-    queue: list[tuple[str, int]] = [(root_url, 0)]
+
+    # Seed priority routes first so critical pages are always attempted
+    base = root_url.rstrip("/")
+    priority_urls = [base + route for route in PRIORITY_ROUTES]
+    # root_url itself is already the first priority; deduplicate while preserving order
+    seen_seed: set[str] = set()
+    seeded: list[tuple[str, int]] = []
+    for u in priority_urls:
+        if u not in seen_seed:
+            seen_seed.add(u)
+            seeded.append((u, 0))
+
+    queue: list[tuple[str, int]] = seeded
     pages: list[dict] = []
 
     async with httpx.AsyncClient(

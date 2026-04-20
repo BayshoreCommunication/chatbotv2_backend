@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timezone
 
 from bson import ObjectId
-from fastapi import APIRouter, Header, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel
 
 from database import get_database
@@ -32,10 +32,99 @@ from services.chatbot.session_cache import (
     update_session_lead,
 )
 from services.chatbot.tools import build_tools
+from services.chatbot.ws_manager import ws_manager
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
 logger = logging.getLogger(__name__)
+
+
+# ── WebSocket: dashboard owner ────────────────────────────────────────────────
+
+@router.websocket("/{company_id}/ws")
+async def dashboard_ws(company_id: str, websocket: WebSocket):
+    await ws_manager.connect_dashboard(company_id, websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep-alive pings
+    except WebSocketDisconnect:
+        ws_manager.disconnect_dashboard(company_id, websocket)
+
+
+# ── WebSocket: widget visitor ─────────────────────────────────────────────────
+
+@widget_router.websocket("/ws")
+async def widget_ws(
+    websocket: WebSocket,
+    api_key: str = Query(..., alias="apiKey"),
+    session_id: str = Query(default="default", alias="sessionId"),
+):
+    company_id = api_key[4:] if api_key.startswith("org-") else api_key
+    if not ObjectId.is_valid(company_id):
+        await websocket.close(code=4001)
+        return
+
+    session_key = f"{company_id}:{session_id}"
+    await ws_manager.connect_widget(session_key, websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # keep-alive pings from widget
+    except WebSocketDisconnect:
+        ws_manager.disconnect_widget(session_key)
+
+
+# ── Takeover: toggle ──────────────────────────────────────────────────────────
+
+class TakeoverRequest(BaseModel):
+    active: bool
+
+
+@router.patch("/{company_id}/{session_id}/takeover")
+async def toggle_takeover(company_id: str, session_id: str, payload: TakeoverRequest):
+    db = get_database()
+    now = datetime.now(timezone.utc)
+    await db["chat_sessions"].update_one(
+        {"company_id": company_id, "session_id": session_id},
+        {"$set": {"human_takeover": payload.active, "updated_at": now}},
+        upsert=True,
+    )
+    session_key = f"{company_id}:{session_id}"
+    await ws_manager.push_to_widget(session_key, {
+        "type": "takeover_status",
+        "active": payload.active,
+    })
+    return {"ok": True, "human_takeover": payload.active}
+
+
+# ── Owner reply ───────────────────────────────────────────────────────────────
+
+class OwnerReplyRequest(BaseModel):
+    content: str
+
+
+@router.post("/{company_id}/{session_id}/owner-reply")
+async def owner_reply(company_id: str, session_id: str, payload: OwnerReplyRequest):
+    if not payload.content.strip():
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Reply cannot be empty.")
+    db = get_database()
+    now = datetime.now(timezone.utc)
+    msg = {
+        "role": "assistant",
+        "content": payload.content.strip(),
+        "timestamp": now,
+        "source": "human",
+    }
+    await db["chat_sessions"].update_one(
+        {"company_id": company_id, "session_id": session_id},
+        {"$push": {"messages": msg}, "$set": {"updated_at": now}},
+    )
+    session_key = f"{company_id}:{session_id}"
+    await ws_manager.push_to_widget(session_key, {
+        "type": "owner_reply",
+        "content": payload.content.strip(),
+        "timestamp": now.isoformat(),
+    })
+    return {"ok": True}
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -514,13 +603,20 @@ async def _persist_exchange(
         # A name alone is not actionable — only write to `leads` once we have
         # phone or email so the dashboard doesn't show incomplete lead records.
         if lead_info.has_any and (lead_info.phone or lead_info.email):
+            # Merge with session-accumulated lead so a name captured in a prior
+            # turn is included even when the current message only has phone/email.
+            session = get_session(session_id)
+            effective_name  = lead_info.name  or (session.lead_name  if session else None)
+            effective_phone = lead_info.phone or (session.lead_phone if session else None)
+            effective_email = lead_info.email or (session.lead_email if session else None)
+
             lead_set: dict = {"updated_at": now}
-            if lead_info.name:
-                lead_set["name"]  = lead_info.name
-            if lead_info.phone:
-                lead_set["phone"] = lead_info.phone
-            if lead_info.email:
-                lead_set["email"] = lead_info.email
+            if effective_name:
+                lead_set["name"]  = effective_name
+            if effective_phone:
+                lead_set["phone"] = effective_phone
+            if effective_email:
+                lead_set["email"] = effective_email
 
             await db["leads"].update_one(
                 {"company_id": company_id, "session_id": session_id},
@@ -916,12 +1012,57 @@ async def widget_ask(
 
     session_id = (x_session_id or "default").strip() or "default"
 
+    # Check human takeover — if active, store user message silently and return empty answer
+    db = get_database()
+    session_doc = await db["chat_sessions"].find_one(
+        {"company_id": company_id, "session_id": session_id},
+        {"human_takeover": 1},
+    )
+    if session_doc and session_doc.get("human_takeover"):
+        now = datetime.now(timezone.utc)
+        await db["chat_sessions"].update_one(
+            {"company_id": company_id, "session_id": session_id},
+            {
+                "$push": {"messages": {"role": "user", "content": payload.message, "timestamp": now}},
+                "$set": {"updated_at": now},
+            },
+        )
+        await ws_manager.notify_dashboard(company_id, {
+            "type": "new_message",
+            "session_id": session_id,
+            "content": payload.message,
+            "timestamp": now.isoformat(),
+        })
+        return WidgetChatResponse(answer="", session_id=session_id, company_id=company_id)
+
+    # Notify dashboard: visitor message arrived + AI is thinking
+    now_pre = datetime.now(timezone.utc)
+    await ws_manager.notify_dashboard(company_id, {
+        "type": "new_message",
+        "session_id": session_id,
+        "content": payload.message,
+        "timestamp": now_pre.isoformat(),
+    })
+    await ws_manager.notify_dashboard(company_id, {
+        "type": "typing_start",
+        "session_id": session_id,
+    })
+
     chat_request = ChatRequest(
         session_id=session_id,
         visitor_id=(x_visitor_id or "").strip() or None,
         message=payload.message,
     )
     chat_response = await chat(company_id, chat_request)
+
+    # Notify dashboard: AI reply ready
+    now_post = datetime.now(timezone.utc)
+    await ws_manager.notify_dashboard(company_id, {
+        "type": "ai_reply",
+        "session_id": session_id,
+        "content": chat_response.reply,
+        "timestamp": now_post.isoformat(),
+    })
 
     return WidgetChatResponse(
         answer=chat_response.reply,

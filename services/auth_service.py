@@ -83,7 +83,10 @@ async def verify_otp(db: AsyncIOMotorDatabase, payload: OTPVerifyRequest) -> dic
     if temp.get("otp_code") != payload.otp_code:
         return {"error": "invalid_otp"}
 
-    if datetime.now(timezone.utc) > temp.get("otp_expires_at", datetime.now(timezone.utc)):
+    otp_expires_at = temp.get("otp_expires_at", datetime.now(timezone.utc))
+    if otp_expires_at.tzinfo is None:
+        otp_expires_at = otp_expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > otp_expires_at:
         return {"error": "otp_expired"}
 
     # ✅ OTP valid — create the real user now
@@ -145,9 +148,11 @@ async def signin(db: AsyncIOMotorDatabase, payload: SigninRequest) -> dict:
     })
 
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "user_id": str(user["_id"]),
-        "company_name": user["company_name"],
-        "role": user["role"],
+        "access_token":       token,
+        "token_type":         "bearer",
+        "user_id":            str(user["_id"]),
+        "company_name":       user["company_name"],
+        "role":               user["role"],
+        "has_paid_subscription": bool(user.get("has_paid_subscription", False)),
+        "subscription_type":  user.get("subscription_type", "free"),
     }

@@ -77,6 +77,12 @@ class TrainRunHistory(BaseModel):
 
 # ── Full training result (returned by trainer.py) ────────────────────────────
 
+class MissingInfoItem(BaseModel):
+    """One required knowledge item that was not found in the extracted entries."""
+    key:   str   # machine-readable identifier
+    label: str   # human-readable description shown to the user
+
+
 class TrainResult(BaseModel):
     """
     Returned by `services.knowledgebase.trainer.train_company()`.
@@ -90,7 +96,8 @@ class TrainResult(BaseModel):
     vector_store_id:   str
     namespace:         str
     last_updated:      datetime
-    knowledge_entries: list[dict] = Field(default_factory=list)  # raw LLM entries
+    knowledge_entries: list[dict] = Field(default_factory=list)
+    missing_info:      list[MissingInfoItem] = Field(default_factory=list)
     error:             Optional[str] = None
 
 
@@ -126,6 +133,12 @@ class KnowledgeBaseDocument(BaseModel):
     entries: list[KnowledgeEntry] = Field(
         default_factory=list,
         description="Every fact the LLM extracted and indexed in Pinecone."
+    )
+
+    # ── Required info items that were NOT found during training ───────────────
+    missing_info: list[MissingInfoItem] = Field(
+        default_factory=list,
+        description="Required info items not found on the website — user can fill these in manually.",
     )
 
     # ── Run history (populated via $push in router) ───────────────────────────

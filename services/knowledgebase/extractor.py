@@ -325,27 +325,53 @@ def _extract_critical_fallback_entries(
     return entries
 
 
-def calculate_quality_score(entries: list[dict], pages_crawled: int) -> float:
+def calculate_quality_score(
+    entries: list[dict],
+    pages_crawled: int,
+    missing_info: list[dict] | None = None,
+) -> float:
     """
-    LLM-aware quality score based on:
-    - Number of distinct entries extracted (40%)
-    - Category diversity (30%)
-    - Source coverage from pages (30%)
+    Quality score based on:
+      - Number of distinct entries extracted (35%)
+      - Category diversity                   (25%)
+      - Source / page coverage               (20%)
+      - Required info completeness           (20%)
+
+    Each missing required info item carries a weighted penalty so the score
+    accurately reflects gaps in the knowledge base.
 
     Returns 0–100.
     """
     if not entries:
         return 0.0
 
-    # Completeness: 30 entries = full score on this axis
-    entry_score = min(1.0, len(entries) / 30) * 40
+    # ── Axis 1: entry count  (35 pts) — 30 entries = full score ──────────────
+    entry_score = min(1.0, len(entries) / 30) * 35
 
-    # Diversity: 9 categories total
+    # ── Axis 2: category diversity  (25 pts) — 9 categories = full score ─────
     categories = {e.get("category", "") for e in entries}
-    diversity_score = min(1.0, len(categories) / 9) * 30
+    diversity_score = min(1.0, len(categories) / 9) * 25
 
-    # Coverage: did the scraper find many pages?
-    coverage_score = min(1.0, pages_crawled / 15) * 30
+    # ── Axis 3: page coverage  (20 pts) — 20 pages = full score ──────────────
+    coverage_score = min(1.0, pages_crawled / 20) * 20
 
-    total = entry_score + diversity_score + coverage_score
-    return round(total, 2)
+    # ── Axis 4: required info completeness  (20 pts) ─────────────────────────
+    # Penalty per missing key — weights reflect business importance.
+    # Total possible penalty = 20 pts (sum of all weights below).
+    _MISSING_WEIGHTS: dict[str, float] = {
+        "company_overview": 4.0,   # home page — most critical
+        "services":         4.0,   # what do you offer?
+        "contact_phone":    3.0,   # lead capture
+        "contact_email":    3.0,   # lead capture
+        "office_address":   2.5,   # location
+        "office_hours":     2.0,   # availability
+        "about_details":    1.5,   # nice-to-have
+    }
+    _TOTAL_WEIGHT = sum(_MISSING_WEIGHTS.values())  # 20.0
+
+    missing_keys = {item["key"] for item in (missing_info or [])}
+    penalty = sum(_MISSING_WEIGHTS.get(k, 0.0) for k in missing_keys)
+    completeness_score = max(0.0, _TOTAL_WEIGHT - penalty)
+
+    total = entry_score + diversity_score + coverage_score + completeness_score
+    return round(min(total, 100.0), 2)

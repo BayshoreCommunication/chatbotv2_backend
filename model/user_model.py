@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ── Type Aliases ─────────────────────────────────────────────────────────────
 
-SubscriptionType = Literal["free", "pro", "enterprise"]
+SubscriptionType = Literal["free", "starter", "professional", "enterprise"]
 
 CompanyType = Literal[
     "tech-company",
@@ -61,6 +61,7 @@ class UserModel(BaseModel):
 
     # ── Subscription ──────────────────────────────────────────────────────────
     is_subscribed: bool = False
+    has_paid_subscription: bool = False          # True when active (non-free)
     subscription_type: SubscriptionType = "free"
     subscription_start_date: Optional[datetime] = None
     subscription_end_date: Optional[datetime] = None

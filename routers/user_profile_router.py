@@ -40,6 +40,9 @@ def _serialize_profile(user: dict[str, Any]) -> dict[str, Any]:
         "avatar": user.get("avatar"),
         "email": user.get("email", ""),
         "role": user.get("role", "organization"),
+        "is_subscribed": user.get("is_subscribed", False),
+        "has_paid_subscription": user.get("has_paid_subscription", False),
+        "subscription_type": user.get("subscription_type", "free"),
     }
 
 
