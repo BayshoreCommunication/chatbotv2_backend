@@ -124,7 +124,7 @@ async def owner_reply(company_id: str, session_id: str, payload: OwnerReplyReque
         "content": payload.content.strip(),
         "timestamp": now.isoformat(),
     })
-    return {"ok": True}
+    return {"ok": True, "timestamp": now.isoformat()}
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
