@@ -1,0 +1,18 @@
+[Unit]
+Description=Chatbot V2 FastAPI Backend
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/var/www/chatbot_backend
+# Single worker required — ws_manager is in-memory so multiple workers
+# would each have separate state and WebSocket messages would not route correctly.
+ExecStart=/var/www/chatbot_backend/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

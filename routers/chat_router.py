@@ -1035,13 +1035,11 @@ async def widget_ask(
         })
         return WidgetChatResponse(answer="", session_id=session_id, company_id=company_id)
 
-    # Notify dashboard: visitor message arrived + AI is thinking
-    now_pre = datetime.now(timezone.utc)
     await ws_manager.notify_dashboard(company_id, {
         "type": "new_message",
         "session_id": session_id,
         "content": payload.message,
-        "timestamp": now_pre.isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     await ws_manager.notify_dashboard(company_id, {
         "type": "typing_start",
@@ -1055,13 +1053,11 @@ async def widget_ask(
     )
     chat_response = await chat(company_id, chat_request)
 
-    # Notify dashboard: AI reply ready
-    now_post = datetime.now(timezone.utc)
     await ws_manager.notify_dashboard(company_id, {
         "type": "ai_reply",
         "session_id": session_id,
         "content": chat_response.reply,
-        "timestamp": now_post.isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     })
 
     return WidgetChatResponse(
