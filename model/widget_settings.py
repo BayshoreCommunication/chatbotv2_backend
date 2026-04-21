@@ -15,7 +15,7 @@ class BehaviorSettings(BaseModel):
 
 class ContentSettings(BaseModel):
     welcome_message: str = "Hello! 👋 Welcome to Bayshore Communication. How can I assist you today?"
-    welcome_video: str = "https://www.youtube.com/embed/dQw4w9WgXcQ"
+    welcome_video: str = ""
     welcome_video_autoplay: bool = True
     input_placeholder: str = "Type your question here..."
 
@@ -24,7 +24,7 @@ class LauncherSettings(BaseModel):
     position: str = "bottom-right"
     icon_style: str = "default"
     show_bubbles: bool = True
-    brand_image_url: str = "https://i.ibb.co.com/pvcGHgy9/ocrun0jnwtssa3pbky9y.webp"
+    brand_image_url: str = ""
 
 
 class WidgetSettingsModel(BaseModel):
