@@ -159,6 +159,7 @@ class HistoryMessage(BaseModel):
     role: str
     content: str
     timestamp: datetime | None = None
+    source: str | None = None
 
 
 class ConversationHistoryItem(BaseModel):
@@ -465,6 +466,7 @@ async def conversation_history(
                 role=str(msg.get("role", "")),
                 content=str(msg.get("content", "")),
                 timestamp=msg.get("timestamp"),
+                source=msg.get("source"),
             )
             for msg in doc.get("messages", [])
             if isinstance(msg, dict)
@@ -564,10 +566,31 @@ async def _persist_exchange(
             )
 
         # ── 3. Build the messages to append ───────────────────────────────────
-        new_messages = [
-            {"role": "user",      "content": user_message, "timestamp": now},
-            {"role": "assistant", "content": ai_reply,     "timestamp": now},
-        ]
+        # If the same user message was already saved in the last 30 s (e.g. it was
+        # stored during human takeover and is now being re-sent to the AI after
+        # takeover is released), only append the AI reply to avoid a duplicate.
+        doc_check = await db["chat_sessions"].find_one(
+            {"company_id": company_id, "session_id": session_id},
+            {"messages": {"$slice": -5}},
+        )
+        user_already_saved = False
+        if doc_check:
+            cutoff = now.timestamp() - 30
+            for msg in doc_check.get("messages", []):
+                if msg.get("role") == "user" and msg.get("content") == user_message:
+                    ts = msg.get("timestamp")
+                    if ts and hasattr(ts, "timestamp") and ts.timestamp() > cutoff:
+                        user_already_saved = True
+                        break
+
+        new_messages = (
+            [{"role": "assistant", "content": ai_reply, "timestamp": now}]
+            if user_already_saved
+            else [
+                {"role": "user",      "content": user_message, "timestamp": now},
+                {"role": "assistant", "content": ai_reply,     "timestamp": now},
+            ]
+        )
 
         # ── 4. Upsert the chat session document ───────────────────────────────
         result = await db["chat_sessions"].update_one(
@@ -1098,7 +1121,7 @@ async def widget_history(
         return {"messages": []}
 
     messages = [
-        {"role": msg.get("role", ""), "text": msg.get("content", "")}
+        {"role": msg.get("role", ""), "text": msg.get("content", ""), "source": msg.get("source")}
         for msg in doc.get("messages", [])
         if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
     ]
