@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
 from motor.motor_asyncio import AsyncIOMotorDatabase
+
+logger = logging.getLogger(__name__)
 
 from model.appointments import (
     AppointmentSettingsDoc,
@@ -86,7 +89,16 @@ async def _calendly_get(access_token: str, path: str, params: dict[str, Any] | N
         resp = await client.get(f"{CALENDLY_BASE_URL}{path}", headers=headers, params=params)
 
     if resp.status_code >= 400:
-        raise CalendlyAPIError(f"Calendly API error: {resp.status_code}")
+        try:
+            body = resp.json()
+            detail = body.get("message") or body.get("title") or str(body)
+        except Exception:
+            detail = resp.text or "(no body)"
+        logger.error(
+            "calendly.api_error status=%d path=%s detail=%s",
+            resp.status_code, path, detail,
+        )
+        raise CalendlyAPIError(f"Calendly API error: {resp.status_code} — {detail}")
     return resp.json()
 
 
@@ -164,7 +176,10 @@ async def get_calendly_availability(access_token: str, event_type_uri: str) -> l
         return []
 
     now = datetime.now(timezone.utc)
-    start_time = now.replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    # Start 1 hour ahead — Calendly rejects start_time within the event's
+    # minimum scheduling notice window, causing a 400 when passing exact now.
+    range_start = now + timedelta(hours=1)
+    start_time = range_start.replace(microsecond=0).isoformat().replace("+00:00", "Z")
     end_time = (now + timedelta(days=7)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
     data = await _calendly_get(

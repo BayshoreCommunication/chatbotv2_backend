@@ -733,9 +733,13 @@ def _build_tool_order_instruction(available_tools: list[str]) -> str:
 
     if appt_tools:
         parts.append(
-            "APPOINTMENT SCHEDULING TOOLS (mandatory when user gives a preferred time):\n"
-            "- When the user has chosen to schedule AND given a date/time preference, "
-            "you MUST call check_appointment_setup THEN get_available_appointment_slots immediately.\n"
+            "APPOINTMENT SCHEDULING TOOLS:\n"
+            "- As soon as the user mentions scheduling, booking, appointment, or meeting — "
+            "you MUST call check_appointment_setup IMMEDIATELY (before asking for a time or giving any answer).\n"
+            "- If check_appointment_setup returns 'configured and ready': ask the user for their preferred date/time.\n"
+            "- If check_appointment_setup returns 'not configured' or any error: "
+            "offer phone call or email follow-up. Do NOT say 'unable to schedule' before calling the tool first.\n"
+            "- Once the user gives a time preference, call get_available_appointment_slots immediately.\n"
             "- Do NOT say 'I cannot confirm availability' or 'Would you like me to check?' — "
             "just call the tools and show real results.\n"
             "- Pass preferred_time exactly as the user stated (e.g. '3 pm', '14:00', 'morning').\n"
