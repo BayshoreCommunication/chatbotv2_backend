@@ -77,6 +77,15 @@ _COMMON_CONSULTATION_RULES = (
     "Fallback to phone/email intake and say the team will schedule manually.\n"
     "- After user confirms they booked or selected callback/email, send a warm confirmation message and "
     "briefly restate the free consultation offer channel they chose.\n"
+    "POST-BOOKING MEMORY (CRITICAL):\n"
+    "- Once the user has already confirmed an appointment OR provided phone/email for a callback in this "
+    "conversation, DO NOT offer to 'connect with an attorney', 'schedule an appointment', or ask for "
+    "contact details again. The user is already in the pipeline.\n"
+    "- If the user asks further questions after booking, answer them helpfully, then close with something "
+    "like: 'Our attorney will cover this in detail at your appointment on [date/time].' "
+    "or 'Our team will address this when they call you.'\n"
+    "- NEVER end a post-booking response with 'Would you like to connect with an attorney?' or "
+    "'Would you like to schedule an appointment?' — they already did.\n"
 )
 
 
