@@ -343,10 +343,8 @@ async def chat(company_id: str, payload: ChatRequest):
 
     # ── Side-effect: extract lead info, update cache, persist ────────────────
     # Happens AFTER the LLM reply — does NOT influence the response content.
-    if _looks_like_contact_share_message(payload.message):
-        message_lead = await extract_lead_info_async(payload.message)
-    else:
-        message_lead = LeadInfo()
+    # Always run extraction — the LLM returns all-null for non-contact messages.
+    message_lead = await extract_lead_info_async(payload.message)
 
     if message_lead.has_any:
         update_session_lead(
@@ -543,6 +541,9 @@ async def _persist_exchange(
         if visitor_id:
             set_fields["visitor_id"] = visitor_id
 
+        if lead_info.inquiry:
+            set_fields["lead_message"] = lead_info.inquiry
+
         if lead_info.has_any:
             if lead_info.name:
                 set_fields["lead_name"]  = lead_info.name
@@ -557,12 +558,13 @@ async def _persist_exchange(
 
             logger.debug(
                 "chat.lead.detected company_id=%s session_id=%s "
-                "lead_captured=%s name=%r phone=%r email=%r",
+                "lead_captured=%s name=%r phone=%r email=%r inquiry=%r",
                 company_id, session_id,
                 bool(lead_info.phone or lead_info.email),
                 _mask_value(lead_info.name),
                 _mask_value(lead_info.phone),
                 _mask_value(lead_info.email),
+                lead_info.inquiry,
             )
 
         # ── 3. Build the messages to append ───────────────────────────────────
@@ -625,13 +627,15 @@ async def _persist_exchange(
         # ── 5. Upsert into the `leads` collection only when a contact method exists ─
         # A name alone is not actionable — only write to `leads` once we have
         # phone or email so the dashboard doesn't show incomplete lead records.
-        if lead_info.has_any and (lead_info.phone or lead_info.email):
+        if lead_info.has_any:
             # Merge with session-accumulated lead so a name captured in a prior
             # turn is included even when the current message only has phone/email.
             session = get_session(session_id)
             effective_name  = lead_info.name  or (session.lead_name  if session else None)
             effective_phone = lead_info.phone or (session.lead_phone if session else None)
             effective_email = lead_info.email or (session.lead_email if session else None)
+
+            effective_inquiry = lead_info.inquiry
 
             lead_set: dict = {"updated_at": now}
             if effective_name:
@@ -640,6 +644,8 @@ async def _persist_exchange(
                 lead_set["phone"] = effective_phone
             if effective_email:
                 lead_set["email"] = effective_email
+            if effective_inquiry:
+                lead_set["message"] = effective_inquiry
 
             await db["leads"].update_one(
                 {"company_id": company_id, "session_id": session_id},

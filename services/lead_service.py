@@ -15,6 +15,7 @@ def serialize_lead(lead: dict) -> dict:
         "message": lead.get("message"),
         "is_contacted": lead.get("is_contacted", False),
         "created_at": lead.get("created_at"),
+        "updated_at": lead.get("updated_at"),
     }
 
 async def get_leads_by_company(db: AsyncIOMotorDatabase, company_id: str) -> List[dict]:
