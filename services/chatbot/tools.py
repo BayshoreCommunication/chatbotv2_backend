@@ -364,13 +364,31 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
     @tool(
         "get_slot_booking_link",
         description=(
-            "Get the exact Calendly confirmation URL for a selected slot start_time "
-            "(ISO format). Use after the user picks a specific time and shares name/email. "
-            "Important: this returns a confirmation page link only; appointment is NOT complete "
-            "until the user finishes the Calendly form and confirms completion."
+            "Get the Calendly confirmation URL for a selected appointment slot. "
+            "Pass slot_start_time (ISO format, from the iso_start_time field in the slots output) "
+            "AND confirmation_url (the confirmation_url value from the same slot — avoids a second "
+            "Calendly API call). Use after the user picks a slot and shares their name/email. "
+            "Important: the link is a confirmation page only; appointment is NOT complete until "
+            "the user finishes the Calendly form and confirms."
         ),
     )
-    async def get_slot_booking_link(slot_start_time: str) -> str:
+    async def get_slot_booking_link(
+        slot_start_time: str,
+        confirmation_url: str = "",
+    ) -> str:
+        target = slot_start_time.strip()
+        if not target:
+            return "Please provide a slot_start_time in ISO format."
+
+        # If the LLM already has the URL from the prior get_available_appointment_slots
+        # output, use it directly — no need to call the Calendly API again.
+        if confirmation_url.strip():
+            return (
+                f"Appointment confirmation page for {target}: {confirmation_url.strip()}. "
+                "Status: pending user completion."
+            )
+
+        # Fallback: re-fetch from Calendly (happens only if LLM omitted confirmation_url).
         db = get_database()
         settings_doc = await get_user_calendly_settings(db, company_id)
 
@@ -390,10 +408,6 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
                 f"Could not fetch booking link right now: {exc}. "
                 "Offer phone or email consultation instead."
             )
-
-        target = slot_start_time.strip()
-        if not target:
-            return "Please provide a slot_start_time in ISO format."
 
         for slot in slots:
             if slot.start_time == target:

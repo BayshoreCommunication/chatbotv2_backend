@@ -164,8 +164,7 @@ async def create_or_refresh_session(
 
         existing = _session_store.get(thread_id)
         if existing and existing.is_alive():
-            # Refresh timezone if newly provided
-            if user_timezone and not existing.user_timezone:
+            if user_timezone:
                 existing.user_timezone = user_timezone
             existing.touch()
             logger.debug("session_cache.refresh thread_id=%s", thread_id)

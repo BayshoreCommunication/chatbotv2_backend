@@ -45,7 +45,7 @@ async def get_user_calendly_settings(db: AsyncIOMotorDatabase, user_id: str) -> 
 async def save_user_calendly_settings(
     db: AsyncIOMotorDatabase, user_id: str, settings: CalendlySettings
 ) -> CalendlySettings:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     doc = AppointmentSettingsDoc(
         user_id=user_id,
         calendly_url=settings.calendly_url,

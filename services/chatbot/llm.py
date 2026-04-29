@@ -48,6 +48,7 @@ llm = ChatOpenAI(
     model="gpt-4o-mini",       # swap to "gpt-4o" for higher quality
     temperature=0.7,            # lower = more consistent / factual
     openai_api_key=settings.OPENAI_API_KEY,
+    max_retries=3,              # auto-retry on transient 5xx / network errors
     callbacks=[_token_logger],
 )
 

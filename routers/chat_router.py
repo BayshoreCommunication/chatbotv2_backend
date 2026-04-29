@@ -15,9 +15,11 @@ import time
 from datetime import datetime, timezone
 
 from bson import ObjectId
-from fastapi import APIRouter, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from jose import JWTError, jwt
 from pydantic import BaseModel
 
+from config import settings
 from database import get_database
 from services.chatbot import (
     build_company_agent,
@@ -37,6 +39,38 @@ from services.chatbot.ws_manager import ws_manager
 router = APIRouter(prefix="/chat", tags=["Chat"])
 widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
 logger = logging.getLogger(__name__)
+
+# Short acknowledgements that can never contain contact info — skip LLM extraction.
+_SKIP_EXTRACTION_WORDS = frozenset({
+    "yes", "no", "okay", "ok", "sure", "hi", "hello",
+    "thanks", "thank you", "confirmed", "yesterday", "today",
+    "nope", "yep", "yup", "great", "perfect", "alright", "fine",
+})
+
+
+async def _require_dashboard_auth(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """Verify JWT and return the authenticated user's company_id."""
+    if not authorization:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    token = authorization.strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except JWTError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+    user_id = payload.get("sub")
+    if not isinstance(user_id, str) or not ObjectId.is_valid(user_id):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid token subject")
+    db = get_database()
+    user = await db["users"].find_one({"_id": ObjectId(user_id), "is_active": True})
+    if not user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+    return str(user["_id"])
 
 
 # ── WebSocket: dashboard owner ────────────────────────────────────────────────
@@ -80,7 +114,14 @@ class TakeoverRequest(BaseModel):
 
 
 @router.patch("/{company_id}/{session_id}/takeover")
-async def toggle_takeover(company_id: str, session_id: str, payload: TakeoverRequest):
+async def toggle_takeover(
+    company_id: str,
+    session_id: str,
+    payload: TakeoverRequest,
+    auth_company_id: str = Depends(_require_dashboard_auth),
+):
+    if auth_company_id != company_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied.")
     db = get_database()
     now = datetime.now(timezone.utc)
     await db["chat_sessions"].update_one(
@@ -103,7 +144,14 @@ class OwnerReplyRequest(BaseModel):
 
 
 @router.post("/{company_id}/{session_id}/owner-reply")
-async def owner_reply(company_id: str, session_id: str, payload: OwnerReplyRequest):
+async def owner_reply(
+    company_id: str,
+    session_id: str,
+    payload: OwnerReplyRequest,
+    auth_company_id: str = Depends(_require_dashboard_auth),
+):
+    if auth_company_id != company_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied.")
     if not payload.content.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Reply cannot be empty.")
     db = get_database()
@@ -209,6 +257,11 @@ async def chat(company_id: str, payload: ChatRequest):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Message cannot be empty.",
         )
+    if len(payload.message) > 2000:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Message too long (max 2000 characters).",
+        )
 
     logger.info(
         "chat.request.in company_id=%s session_id=%s message_len=%d user_timezone=%r",
@@ -269,8 +322,8 @@ async def chat(company_id: str, payload: ChatRequest):
             user_timezone=(payload.user_timezone or "").strip() or None,
         )
     else:
-        if payload.user_timezone and not session.user_timezone:
-            session.user_timezone = (payload.user_timezone or "").strip() or None
+        if payload.user_timezone:
+            session.user_timezone = payload.user_timezone.strip() or None
 
     # ── Invoke agent — LLM is in full control ────────────────────────────────
     # Router passes ONLY the user's timezone — the one piece of context the LLM
@@ -287,6 +340,27 @@ async def chat(company_id: str, payload: ChatRequest):
 
     user_timezone = (payload.user_timezone or "").strip()
     input_messages: list[tuple[str, str]] = []
+
+    # Inject current lead state so post-booking prompt rules have real data to act on.
+    if session and session.lead_captured:
+        lead_parts: list[str] = []
+        if session.lead_name:
+            lead_parts.append(f"name={session.lead_name!r}")
+        if session.lead_phone:
+            lead_parts.append(f"phone={session.lead_phone!r}")
+        if session.lead_email:
+            lead_parts.append(f"email={session.lead_email!r}")
+        details = ", ".join(lead_parts) or "contact info on file"
+        input_messages.append((
+            "system",
+            f"SESSION STATE — LEAD CAPTURED: This visitor has already shared their contact info "
+            f"({details}). NEVER ask for their name, phone, or email again. "
+            "NEVER offer to 'connect with an attorney' or 'schedule an appointment' — "
+            "they are already in the pipeline. "
+            "Answer their question, then close with: "
+            "'Our team will be in touch. Is there anything else I can help with?'",
+        ))
+
     if user_timezone:
         input_messages.append((
             "system",
@@ -343,8 +417,12 @@ async def chat(company_id: str, payload: ChatRequest):
 
     # ── Side-effect: extract lead info, update cache, persist ────────────────
     # Happens AFTER the LLM reply — does NOT influence the response content.
-    # Always run extraction — the LLM returns all-null for non-contact messages.
-    message_lead = await extract_lead_info_async(payload.message)
+    # Skip LLM extraction for short acknowledgements that can't contain contact info.
+    _stripped_lower = payload.message.strip().lower()
+    if _stripped_lower in _SKIP_EXTRACTION_WORDS or len(_stripped_lower) < 4:
+        message_lead = LeadInfo()
+    else:
+        message_lead = await extract_lead_info_async(payload.message)
 
     if message_lead.has_any:
         update_session_lead(
@@ -630,7 +708,7 @@ async def _persist_exchange(
         if lead_info.has_any:
             # Merge with session-accumulated lead so a name captured in a prior
             # turn is included even when the current message only has phone/email.
-            session = get_session(session_id)
+            session = get_session(f"{company_id}:{session_id}")
             effective_name  = lead_info.name  or (session.lead_name  if session else None)
             effective_phone = lead_info.phone or (session.lead_phone if session else None)
             effective_email = lead_info.email or (session.lead_email if session else None)
@@ -703,175 +781,6 @@ def _mask_value(value: str | None, keep_tail: int = 2) -> str:
     return ("*" * (len(value) - keep_tail)) + value[-keep_tail:]
 
 
-def _build_tool_order_instruction(available_tools: list[str]) -> str:
-    """
-    Build a per-turn system instruction telling the LLM exactly which tools
-    to call and in what order.  Covers both fact-retrieval tools and appointment
-    scheduling tools so the agent never skips a mandatory tool call.
-    """
-    fact_tools = [
-        t for t in ("knowledge_base", "web_search", "wikipedia")
-        if t in available_tools
-    ]
-    appt_tools = [
-        t for t in ("check_appointment_setup", "get_available_appointment_slots", "get_slot_booking_link")
-        if t in available_tools
-    ]
-
-    parts: list[str] = []
-
-    if fact_tools:
-        steps = " -> ".join(fact_tools)
-        parts.append(
-            "FACT-RETRIEVAL TOOLS (mandatory for company/legal/factual questions):\n"
-            f"Required order: {steps}.\n"
-            "- Call knowledge_base FIRST for any company-specific question.\n"
-            "- If knowledge_base returns nothing useful, call web_search NEXT.\n"
-            "- Only say 'I don't have that verified' after trying ALL available fact tools.\n"
-            "- The user's lead-capture status does NOT exempt you from calling tools.\n"
-            "- EXCEPTION: Off-topic questions (politics, sports, trivia) — politely refuse."
-        )
-    else:
-        parts.append(
-            "No factual retrieval tools available. "
-            "Do not invent facts. Ask a focused follow-up question when uncertain."
-        )
-
-    if appt_tools:
-        parts.append(
-            "APPOINTMENT SCHEDULING TOOLS:\n"
-            "- As soon as the user mentions scheduling, booking, appointment, or meeting — "
-            "you MUST call check_appointment_setup IMMEDIATELY (before asking for a time or giving any answer).\n"
-            "- If check_appointment_setup returns 'configured and ready': ask the user for their preferred date/time.\n"
-            "- If check_appointment_setup returns 'not configured' or any error: "
-            "offer phone call or email follow-up. Do NOT say 'unable to schedule' before calling the tool first.\n"
-            "- Once the user gives a time preference, call get_available_appointment_slots immediately.\n"
-            "- Do NOT say 'I cannot confirm availability' or 'Would you like me to check?' — "
-            "just call the tools and show real results.\n"
-            "- Pass preferred_time exactly as the user stated (e.g. '3 pm', '14:00', 'morning').\n"
-            "- Pass user_timezone from the session context when available.\n"
-            "- After user picks a slot and gives name+email, call get_slot_booking_link "
-            "with the exact iso_start_time and share the confirmation page URL immediately.\n"
-            "- DATE RULE FOR SCHEDULING: When user says 'tomorrow' or a future date for an APPOINTMENT, "
-            "treat it as the literal next calendar day. This rule is for SCHEDULING ONLY.\n"
-            "  (The 'did you mean yesterday?' date check only applies when asking about the accident/incident date.)"
-        )
-
-    return "\n\n".join(parts)
-
-
-def _tool_outputs_insufficient(tool_outputs: list[str]) -> bool:
-    # BUG 2 FIX: Previously, empty strings (returned by knowledge_base when no
-    # docs are found) were filtered via `if out`, leaving only the web_search
-    # result.  If that web result's body happened to contain a failure-marker
-    # substring (e.g. "no longer available" in a quoted news headline), ALL
-    # remaining outputs were flagged and the good web_search reply was silently
-    # discarded and replaced with the generic fallback string.
-    #
-    # Correct logic:
-    #   - Empty strings = KB found nothing (treat as "no result", not a failure).
-    #   - Only flag as insufficient when EVERY non-empty output explicitly
-    #     signals a tool-level error, not just a substring coincidence.
-    #   - Exclude "missing" and "empty" as standalone markers — too broad.
-    if not tool_outputs:
-        return False
-    non_empty = [out.strip() for out in tool_outputs if out and out.strip()]
-    if not non_empty:
-        # All outputs were empty (KB returned no docs) — let the reply stand.
-        return False
-    markers = (
-        "no available",
-        "no answer",
-        "not found",
-        "cannot fetch",
-        "could not fetch",
-        "not configured",
-        "no longer available",
-    )
-    return all(any(marker in out.lower() for marker in markers) for out in non_empty)
-
-
-def _reply_acknowledges_uncertainty(reply: str) -> bool:
-    text = (reply or "").lower()
-    markers = (
-        "don't have",
-        "do not have",
-        "not enough",
-        "cannot confirm",
-        "can't confirm",
-        "not sure",
-        "uncertain",
-    )
-    return any(marker in text for marker in markers)
-
-
-def _is_information_request(message: str) -> bool:
-    text = (message or "").strip().lower()
-    if not text:
-        return False
-
-    # Skip tiny acknowledgements and pure chit-chat
-    tiny = {
-        "ok", "okay", "yes", "no", "sure", "hi", "hello", "thanks", "thank you",
-        "confirm", "confirmed",
-    }
-    if text in tiny:
-        return False
-
-    keywords = (
-        "what", "which", "where", "when", "who", "how",
-        "address", "email", "phone", "contact", "office",
-        "price", "cost", "fee", "hours", "service", "policy",
-        "details", "information", "compensation", "claim", "process",
-        "experience", "attorney", "lawyer", "years", "how long",
-        "team", "staff", "partner", "founder", "practice",
-        "location", "area", "state", "handle", "speciali",
-        "win rate", "success", "settlement", "case",
-    )
-    return any(k in text for k in keywords) or "?" in text
-
-
-def _is_scheduling_time_response(message: str) -> bool:
-    """
-    Return True when the user's message looks like a time/date preference
-    response to a scheduling question (e.g. '3 pm', 'tomorrow at 10', 'morning').
-    Used to trigger a retry that forces the agent to call appointment tools
-    instead of answering from memory.
-    """
-    import re
-    text = (message or "").strip().lower()
-    if not text or len(text) > 80:  # long messages are unlikely to be bare time responses
-        return False
-
-    # Tiny non-scheduling words to skip
-    tiny = {"ok", "okay", "yes", "no", "sure", "hi", "hello", "thanks", "thank you"}
-    if text in tiny:
-        return False
-
-    # Explicit time-of-day markers
-    time_keywords = ("am", "pm", "morning", "afternoon", "evening", "noon", "midnight", "o'clock")
-    if any(k in text for k in time_keywords):
-        return True
-
-    # HH:MM pattern
-    if re.search(r"\b\d{1,2}:\d{2}\b", text):
-        return True
-
-    # Bare digit that looks like an hour (e.g. "7", "14")
-    if re.fullmatch(r"\d{1,2}", text.strip()):
-        return True
-
-    # Date/day words in a short message (strongly scheduling context)
-    schedule_words = (
-        "tomorrow", "today", "monday", "tuesday", "wednesday",
-        "thursday", "friday", "saturday", "sunday",
-        "next week", "this week", "next monday",
-    )
-    if any(k in text for k in schedule_words):
-        return True
-
-    return False
-
 
 async def _get_session_lead_state(company_id: str, session_id: str) -> dict[str, str | bool | None]:
     """Read lead capture fields for this session, if they exist."""
@@ -925,86 +834,6 @@ async def _get_visitor_lead_state(company_id: str, visitor_id: str) -> dict[str,
         "lead_phone":    doc.get("lead_phone"),
         "lead_email":    doc.get("lead_email"),
     }
-
-
-def _is_callback_timing_question(message: str) -> bool:
-    text = (message or "").strip().lower()
-    if not text:
-        return False
-    if "when" in text and ("call" in text or "callback" in text):
-        return True
-    if "how soon" in text and ("call" in text or "callback" in text):
-        return True
-    timing_phrases = (
-        "when call your attorney",
-        "when will attorney call",
-        "when your team call",
-        "when will you call me",
-        "callback time",
-    )
-    return any(phrase in text for phrase in timing_phrases)
-
-
-def _build_callback_timing_reply(lead_name: str | None, lead_phone: str | None) -> str:
-    if lead_phone:
-        name_part = f", {lead_name}" if lead_name else ""
-        return (
-            f"Thanks{name_part}. I already have your contact details. "
-            "Our intake team will reach out to you shortly to review your case. "
-            "Is there anything else you'd like to share about your situation before they call?"
-        )
-    return (
-        "I can arrange that now. Please share your best phone number and preferred call time window, "
-        "and our intake team will reach out."
-    )
-
-
-def _build_post_lead_capture_reply_if_needed(
-    message: str,
-    session_lead_captured: bool,
-    message_lead: LeadInfo,
-    effective_lead_name: str | None,
-    effective_lead_phone: str | None,
-    effective_lead_email: str | None,
-) -> str | None:
-    """
-    Deterministic guard: if user shares PHONE contact details, do not let the
-    LLM restart the intake flow.
-
-    IMPORTANT — Email is intentionally excluded from triggering this short-circuit.
-    Reason: an email address is legitimately required mid-flow for Calendly
-    appointment confirmation (the agent asks for name + email to book a slot).
-    If we short-circuit on email, we bypass the agent before it can call
-    `get_slot_booking_link` and the appointment confirmation URL is never sent.
-    Phone numbers are unambiguously lead-capture, so we still guard on those.
-    """
-    if session_lead_captured:
-        return None
-    if not getattr(message_lead, "has_any", False):
-        return None
-    if not _looks_like_contact_share_message(message):
-        return None
-
-    # Only short-circuit when the user shares a phone number.
-    # Email alone → let the agent decide (could be appointment booking).
-    if effective_lead_phone:
-        name_part = f", {effective_lead_name}" if effective_lead_name else ""
-        return (
-            f"Thanks{name_part}. I have your details and our intake team will call you shortly for a free review. "
-            "Is there anything else you'd like to share about your situation before we connect?"
-        )
-
-    # Email only — do NOT short-circuit. Return None so the agent handles it.
-    # This allows the agent to proceed with `get_slot_booking_link` when the
-    # user is in the middle of scheduling an appointment.
-    if effective_lead_email and not effective_lead_phone:
-        return None
-
-    # Name only (no phone, no email) — gently ask for a contact method.
-    return (
-        "Thanks. I have your name. Can I get your best phone number so our intake team can call you "
-        "for your free case review?"
-    )
 
 
 # ── Public widget endpoint ────────────────────────────────────────────────────
@@ -1136,32 +965,3 @@ async def widget_history(
         if isinstance(msg, dict) and msg.get("role") in ("user", "assistant")
     ]
     return {"messages": messages}
-
-
-def _looks_like_contact_share_message(message: str) -> bool:
-    text = (message or "").strip().lower()
-    if not text:
-        return False
-
-    # Keyword-based detection (e.g. "my name is...", "my phone is...", "email me at...")
-    indicators = (
-        "my name",
-        "name is",
-        "phone",
-        "number",
-        "call me",
-        "email",
-        "@",
-    )
-    if any(token in text for token in indicators):
-        return True
-
-    # Raw phone number detection: message is mostly digits (e.g. "01792843207", "+1 555 1234")
-    # Strip common phone separators and count digits vs total length.
-    stripped = text.replace(" ", "").replace("-", "").replace("+", "").replace("(", "").replace(")", "").replace(".", "")
-    if stripped and len(stripped) >= 6:
-        digit_ratio = sum(c.isdigit() for c in stripped) / len(stripped)
-        if digit_ratio >= 0.8:
-            return True
-
-    return False
