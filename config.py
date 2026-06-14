@@ -13,11 +13,9 @@ class Settings(BaseSettings):
     ALGORITHM: str
     ACCESS_TOKEN_EXPIRE_MINUTES: int
 
-    # ── SMTP Email ────────────────────────────────────────────────────────────
-    SMTP_HOST: str
-    SMTP_PORT: int
-    SMTP_MAIL: str
-    SMTP_PASSWORD: str
+    # ── Email (Resend) ────────────────────────────────────────────────────────
+    RESEND_API_KEY: str
+    RESEND_FROM_EMAIL: str = "onboarding@resend.dev"
     FRONTEND_URL: str
 
     # ── OpenAI ────────────────────────────────────────────────────────────────

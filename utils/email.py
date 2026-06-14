@@ -1,12 +1,12 @@
-import aiosmtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import httpx
 
 from config import settings
 
+RESEND_API_URL = "https://api.resend.com/emails"
+
 
 async def send_otp_email(to_email: str, company_name: str, otp: str) -> None:
-    """Send a 6-digit OTP verification email via Gmail SMTP SSL."""
+    """Send a 6-digit OTP verification email via the Resend API."""
 
     subject = "Verify Your Email — OTP Code"
 
@@ -26,17 +26,16 @@ async def send_otp_email(to_email: str, company_name: str, otp: str) -> None:
     </div>
     """
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = settings.SMTP_MAIL
-    msg["To"] = to_email
-    msg.attach(MIMEText(html_body, "html"))
-
-    await aiosmtplib.send(
-        msg,
-        hostname=settings.SMTP_HOST,
-        port=settings.SMTP_PORT,
-        username=settings.SMTP_MAIL,
-        password=settings.SMTP_PASSWORD,
-        use_tls=True,           # port 465 = SSL (use_tls=True)
-    )
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
