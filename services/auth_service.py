@@ -1,3 +1,4 @@
+import logging
 import random
 import string
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,8 @@ from services.user_service import hash_password, verify_password, serialize_user
 from model.user_model import UserModel
 from schemas.user import SignupRequest, OTPVerifyRequest, SigninRequest
 from utils.email import send_otp_email
+
+logger = logging.getLogger(__name__)
 
 
 def _generate_otp() -> str:
@@ -61,6 +64,7 @@ async def signup(db: AsyncIOMotorDatabase, payload: SignupRequest) -> dict:
             otp=otp,
         )
     except Exception as e:
+        logger.error("Failed to send OTP email to %s: %s", payload.email, e, exc_info=True)
         return {"error": "email_send_failed", "detail": str(e)}
 
     return {
