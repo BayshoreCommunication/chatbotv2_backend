@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ── Request / Response schemas ────────────────────────────────────────────────
 
 class CheckoutRequest(BaseModel):
-    tier:         str = "professional"   # starter | professional | enterprise
+    tier:         str = "professional"   # free | professional | enterprise
     billing_cycle: str = "monthly"       # monthly | annual
     success_url:  str
     cancel_url:   str
@@ -159,6 +159,9 @@ async def get_status(
         current_period_end=doc.get("current_period_end"),
         trial_end=doc.get("trial_end"),
         is_active=is_active,
+        conversation_limit=doc.get("conversation_limit"),
+        conversations_used=doc.get("conversations_used", 0),
+        free_trial_used=doc.get("free_trial_used", False),
         created_at=doc["created_at"],
         updated_at=doc["updated_at"],
     )
@@ -187,8 +190,8 @@ async def stripe_webhook(
             sig_header=stripe_signature,
             secret=settings.STRIPE_WEBHOOK_SECRET,
         )
-    except stripe.SignatureVerificationError:
-        logger.warning("subscription.webhook.invalid_signature")
+    except stripe.SignatureVerificationError as e:
+        logger.warning("subscription.webhook.invalid_signature error=%s", e)
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid Stripe signature.")
     except Exception as e:
         logger.error("subscription.webhook.parse_error error=%s", e)

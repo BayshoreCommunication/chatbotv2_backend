@@ -15,12 +15,13 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from config import settings
+from model.subscription_model import CONVERSATION_LIMITS
 
 logger = logging.getLogger(__name__)
 
 PRICE_MAP: dict[str, str] = {
-    "starter:monthly":       "price_1RyxWWFS3P7wS29bZsXvMCOR",
-    "starter:annual":        "price_1RyxWWFS3P7wS29bZsXvMCOR",
+    "free:monthly":          "price_1RyxWWFS3P7wS29bZsXvMCOR",
+    "free:annual":           "price_1RyxWWFS3P7wS29bZsXvMCOR",
     "professional:monthly":  "price_1RyxVtFS3P7wS29b940JDA7E",
     "professional:annual":   "price_1SRPfGFS3P7wS29b1LEGA6HR",
     "enterprise:monthly":    "price_1RyxUsFS3P7wS29bjiaTZag4",
@@ -28,10 +29,42 @@ PRICE_MAP: dict[str, str] = {
 }
 
 PLAN_TRAIN_LIMITS: dict[str, int] = {
-    "starter":      5,
+    "free":         5,
     "professional": 20,
     "enterprise":   100,
 }
+
+# "starter" was renamed to "free" — normalize old tier values found in
+# existing Stripe metadata / subscription docs onto the new name.
+_LEGACY_TIER_ALIASES: dict[str, str] = {"starter": "free"}
+
+
+def _normalize_tier(tier: str | None) -> str:
+    if not tier:
+        return "professional"
+    return _LEGACY_TIER_ALIASES.get(tier, tier)
+
+
+def _mark_free_trial_used(doc: dict, existing_tier: str | None, tier: str) -> None:
+    """
+    Permanently flag a company's one-time free-tier conversation allotment as
+    consumed once it moves off the "free" plan onto a paid tier — so it can
+    never be re-granted by downgrading back to "free" later.
+    """
+    if existing_tier == "free" and tier != "free":
+        doc["free_trial_used"] = True
+
+
+def _apply_free_tier_trial(doc: dict, tier: str) -> None:
+    """
+    The "free" tier is the company's one-time, one-month free trial. Stamp
+    trial_start/trial_end from the plan's billing period and immediately mark
+    the allotment as used — it is granted exactly once per company.
+    """
+    if tier == "free":
+        doc["trial_start"]     = doc.get("current_period_start")
+        doc["trial_end"]       = doc.get("current_period_end")
+        doc["free_trial_used"] = True
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -63,6 +96,24 @@ def _read_metadata(obj: Any) -> dict:
         return {}
 
 
+def _period_bounds(sub: Any) -> tuple[datetime | None, datetime | None]:
+    """
+    Stripe moved `current_period_start` / `current_period_end` from the
+    Subscription object onto each SubscriptionItem (API versions
+    2025-03-31+). Check both locations so this works either way.
+    """
+    start = getattr(sub, "current_period_start", None)
+    end   = getattr(sub, "current_period_end", None)
+    if start is None or end is None:
+        items_list = getattr(sub, "items", None)
+        items_data = getattr(items_list, "data", []) if items_list else []
+        if items_data:
+            item = items_data[0]
+            start = start if start is not None else getattr(item, "current_period_start", None)
+            end   = end   if end   is not None else getattr(item, "current_period_end", None)
+    return _stripe_ts(start), _stripe_ts(end)
+
+
 def _sub_doc_from_stripe(
     company_id: str,
     sub: Any,
@@ -76,6 +127,7 @@ def _sub_doc_from_stripe(
         price_id = sub["items"].data[0].price.id if sub["items"].data else None
     except Exception:
         price_id = None
+    period_start, period_end = _period_bounds(sub)
     return {
         "company_id":             company_id,
         "stripe_customer_id":     getattr(sub, "customer", None),
@@ -85,12 +137,13 @@ def _sub_doc_from_stripe(
         "billing_cycle":          billing_cycle,
         "payment_amount":         payment_amount,
         "currency":               currency,
+        "conversation_limit":     CONVERSATION_LIMITS.get(tier),
         "subscription_status":    getattr(sub, "status", "active"),
         "cancel_at_period_end":   getattr(sub, "cancel_at_period_end", False),
         "canceled_at":            _stripe_ts(getattr(sub, "canceled_at", None)),
         "ended_at":               _stripe_ts(getattr(sub, "ended_at", None)),
-        "current_period_start":   _stripe_ts(getattr(sub, "current_period_start", None)),
-        "current_period_end":     _stripe_ts(getattr(sub, "current_period_end", None)),
+        "current_period_start":   period_start,
+        "current_period_end":     period_end,
         "trial_start":            _stripe_ts(getattr(sub, "trial_start", None)),
         "trial_end":              _stripe_ts(getattr(sub, "trial_end", None)),
         "updated_at":             now,
@@ -106,7 +159,10 @@ async def _sync_users_doc(
     period_start: datetime | None = None,
 ) -> None:
     is_active = status in ("active", "trialing")
-    has_paid  = status == "active" and tier != "free"
+    # _sync_users_doc is only called when a real Stripe subscription exists
+    # (checkout / subscription / invoice webhooks), so any "active" status
+    # here means a paid plan — regardless of which tier it's labeled.
+    has_paid  = status == "active"
     now       = datetime.now(timezone.utc)
     fields: dict = {
         "is_subscribed":            is_active,
@@ -144,6 +200,7 @@ async def create_checkout_session(
     cancel_url: str,
 ) -> dict:
     stripe.api_key = settings.STRIPE_SECRET_KEY
+    tier = _normalize_tier(tier)
     logger.info("subscription.checkout.start company_id=%s tier=%s cycle=%s", company_id, tier, billing_cycle)
 
     price_key = f"{tier}:{billing_cycle}"
@@ -274,15 +331,32 @@ async def _on_checkout_completed(db: AsyncIOMotorDatabase, session: Any) -> None
         logger.warning("checkout.completed.no_sub_id session_id=%s company_id=%s", session_id, company_id)
         return
 
-    tier          = metadata.get("tier", "professional")
+    tier          = _normalize_tier(metadata.get("tier", "professional"))
     billing_cycle = metadata.get("billing_cycle", "monthly")
     customer_id   = getattr(session, "customer", None)
     amount_total  = (getattr(session, "amount_total", 0) or 0) / 100
     currency      = getattr(session, "currency", "usd") or "usd"
     now           = datetime.now(timezone.utc)
 
-    logger.info("checkout.completed.writing company_id=%s tier=%s cycle=%s sub_id=%s customer_id=%s",
-                company_id, tier, billing_cycle, sub_id, customer_id)
+    existing_doc  = await db["subscriptions"].find_one({"company_id": company_id}, {"subscription_tier": 1})
+    existing_tier = _normalize_tier(existing_doc["subscription_tier"]) if existing_doc and existing_doc.get("subscription_tier") else None
+
+    # Fetch the full subscription so period/trial dates are filled in right away
+    # instead of waiting on a separate customer.subscription.* webhook.
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    try:
+        sub = stripe.Subscription.retrieve(sub_id)
+    except stripe.StripeError as e:
+        logger.error("checkout.completed.subscription_retrieve_error sub_id=%s error=%s", sub_id, e)
+        sub = None
+
+    period_start, period_end = _period_bounds(sub) if sub else (None, None)
+    trial_start  = _stripe_ts(getattr(sub, "trial_start", None)) if sub else None
+    trial_end    = _stripe_ts(getattr(sub, "trial_end", None))   if sub else None
+    sub_status   = getattr(sub, "status", "active") if sub else "active"
+
+    logger.info("checkout.completed.writing company_id=%s tier=%s cycle=%s sub_id=%s customer_id=%s status=%s",
+                company_id, tier, billing_cycle, sub_id, customer_id, sub_status)
 
     doc = {
         "company_id":             company_id,
@@ -292,19 +366,31 @@ async def _on_checkout_completed(db: AsyncIOMotorDatabase, session: Any) -> None
         "billing_cycle":          billing_cycle,
         "payment_amount":         amount_total,
         "currency":               currency,
-        "subscription_status":    "active",
+        "conversation_limit":     CONVERSATION_LIMITS.get(tier),
+        "subscription_status":    sub_status,
         "cancel_at_period_end":   False,
+        "current_period_start":   period_start,
+        "current_period_end":     period_end,
+        "trial_start":            trial_start,
+        "trial_end":              trial_end,
         "updated_at":             now,
     }
+    _mark_free_trial_used(doc, existing_tier, tier)
+    _apply_free_tier_trial(doc, tier)
+
+    set_on_insert: dict[str, Any] = {"created_at": now, "conversations_used": 0}
+    if "free_trial_used" not in doc:
+        set_on_insert["free_trial_used"] = False
+
     result = await db["subscriptions"].update_one(
         {"company_id": company_id},
-        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        {"$set": doc, "$setOnInsert": set_on_insert},
         upsert=True,
     )
     logger.info("checkout.completed.subscriptions_write matched=%s upserted_id=%s",
                 result.matched_count, result.upserted_id)
 
-    await _sync_users_doc(db, company_id, "active", tier, None)
+    await _sync_users_doc(db, company_id, sub_status, tier, period_end, period_start)
     logger.info("checkout.completed.done company_id=%s", company_id)
 
 
@@ -324,7 +410,8 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         return
 
     existing_doc  = await db["subscriptions"].find_one({"company_id": company_id}, {"subscription_tier": 1, "billing_cycle": 1})
-    tier          = metadata.get("tier") or (existing_doc.get("subscription_tier") if existing_doc else None) or "professional"
+    existing_tier = _normalize_tier(existing_doc["subscription_tier"]) if existing_doc and existing_doc.get("subscription_tier") else None
+    tier          = _normalize_tier(metadata.get("tier") or (existing_doc.get("subscription_tier") if existing_doc else None))
     billing_cycle = metadata.get("billing_cycle") or (existing_doc.get("billing_cycle") if existing_doc else None) or "monthly"
 
     items_list = getattr(sub, "items", None)
@@ -339,17 +426,23 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
     now = datetime.now(timezone.utc)
     doc = _sub_doc_from_stripe(company_id, sub, tier, billing_cycle, amount, currency)
     doc["updated_at"] = now
+    _mark_free_trial_used(doc, existing_tier, tier)
+    _apply_free_tier_trial(doc, tier)
+
+    set_on_insert: dict[str, Any] = {"created_at": now, "conversations_used": 0}
+    if "free_trial_used" not in doc:
+        set_on_insert["free_trial_used"] = False
 
     result = await db["subscriptions"].update_one(
         {"company_id": company_id},
-        {"$set": doc, "$setOnInsert": {"created_at": now}},
+        {"$set": doc, "$setOnInsert": set_on_insert},
         upsert=True,
     )
     logger.info("subscription.upsert.db_write matched=%s upserted_id=%s", result.matched_count, result.upserted_id)
 
     await _sync_users_doc(
         db, company_id, getattr(sub, "status", "active"), tier,
-        _stripe_ts(getattr(sub, "current_period_end", None)),
+        doc["current_period_end"], doc["current_period_start"],
     )
     logger.info("subscription.upsert.done company_id=%s", company_id)
 
@@ -417,7 +510,7 @@ async def _on_payment_succeeded(db: AsyncIOMotorDatabase, invoice: Any) -> None:
             "updated_at":           now,
         }},
     )
-    tier = existing.get("subscription_tier", "professional")
+    tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "active", tier, period_end, period_start)
     logger.info("payment.succeeded.done company_id=%s period_end=%s", company_id, period_end)
 
@@ -439,6 +532,6 @@ async def _on_payment_failed(db: AsyncIOMotorDatabase, invoice: Any) -> None:
         {"company_id": company_id},
         {"$set": {"subscription_status": "past_due", "updated_at": now}},
     )
-    tier = existing.get("subscription_tier", "professional")
+    tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "past_due", tier, existing.get("current_period_end"))
     logger.info("payment.failed.done company_id=%s", company_id)

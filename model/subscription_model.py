@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 # ── Enum-style Literals ───────────────────────────────────────────────────────
 
 SubscriptionTier = Literal[
-    "starter",
+    "free",
     "professional",
     "enterprise",
 ]
@@ -38,6 +38,17 @@ SubscriptionStatus = Literal[
 ]
 
 BillingCycle = Literal["monthly", "annual"]
+
+
+# ── Conversation limits per plan ──────────────────────────────────────────────
+# `None` means unlimited. The "free" tier's allotment is a one-time grant per
+# company (tracked via `free_trial_used`) — it is not renewed automatically.
+
+CONVERSATION_LIMITS: dict[SubscriptionTier, Optional[int]] = {
+    "free":         1000,
+    "professional": 5000,
+    "enterprise":   None,
+}
 
 
 # ── Main Document Model ───────────────────────────────────────────────────────
@@ -72,6 +83,20 @@ class SubscriptionModel(BaseModel):
         min_length=3,
         max_length=3,
         description="ISO 4217 currency code, lowercase (e.g. 'usd', 'gbp').",
+    )
+
+    # ── Conversation usage ───────────────────────────────────────────────────
+    conversation_limit: Optional[int] = Field(
+        default=CONVERSATION_LIMITS["free"],
+        description="Conversation cap for the current plan. None = unlimited (enterprise).",
+    )
+    conversations_used: int = Field(
+        0, ge=0,
+        description="Conversations consumed so far (free tier: one-time lifetime total; paid tiers: current period).",
+    )
+    free_trial_used: bool = Field(
+        False,
+        description="True once this company has consumed its one-time free-tier conversation allotment.",
     )
 
     # ── Status ────────────────────────────────────────────────────────────────
@@ -149,5 +174,10 @@ class SubscriptionResponse(BaseModel):
     current_period_end:     Optional[datetime]
     trial_end:              Optional[datetime]
     is_active:              bool
+    conversation_limit:     Optional[int] = None
+    conversations_used:     int = 0
+    free_trial_used:        bool = False
     created_at:             datetime
     updated_at:             datetime
+
+
