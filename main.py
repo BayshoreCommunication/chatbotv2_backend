@@ -74,3 +74,11 @@ app.include_router(dashboard_router.router,         prefix="/api/v1")
 @app.get("/", tags=["Health"])
 async def root():
     return {"status": "ok", "message": "AI Chatbot SaaS API is running 🚀"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # host="0.0.0.0" = accept connections from any device on the network
+    # (phone, emulator, etc.), not just this machine.
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
