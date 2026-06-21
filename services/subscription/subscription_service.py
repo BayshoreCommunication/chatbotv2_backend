@@ -16,6 +16,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from config import settings
 from model.subscription_model import CONVERSATION_LIMITS
+from services import notification_service
 
 logger = logging.getLogger(__name__)
 
@@ -609,7 +610,10 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         logger.warning("subscription.upsert.no_company_id sub_id=%s", sub_id)
         return
 
-    existing_doc  = await db["subscriptions"].find_one({"company_id": company_id}, {"subscription_tier": 1, "billing_cycle": 1})
+    existing_doc  = await db["subscriptions"].find_one(
+        {"company_id": company_id},
+        {"subscription_tier": 1, "billing_cycle": 1, "cancel_at_period_end": 1},
+    )
     existing_tier = _normalize_tier(existing_doc["subscription_tier"]) if existing_doc and existing_doc.get("subscription_tier") else None
     tier          = _normalize_tier(metadata.get("tier") or (existing_doc.get("subscription_tier") if existing_doc else None))
     billing_cycle = metadata.get("billing_cycle") or (existing_doc.get("billing_cycle") if existing_doc else None) or "monthly"
@@ -644,6 +648,16 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         db, company_id, getattr(sub, "status", "active"), tier,
         doc["current_period_end"], doc["current_period_start"],
     )
+
+    # Notify only on the False→True transition so re-saving an already-ending
+    # subscription doesn't spam a fresh alert on every webhook delivery.
+    was_ending = bool(existing_doc.get("cancel_at_period_end")) if existing_doc else False
+    now_ending = bool(doc.get("cancel_at_period_end"))
+    if now_ending and not was_ending:
+        await notification_service.create_subscription_ending_notification(
+            db, company_id, doc.get("current_period_end"),
+        )
+
     logger.info("subscription.upsert.done company_id=%s", company_id)
 
 
@@ -682,6 +696,7 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
             "updated_at":            now,
         }},
     )
+    await notification_service.create_subscription_canceled_notification(db, company_id)
     logger.info("subscription.deleted.done company_id=%s", company_id)
 
 
@@ -734,4 +749,5 @@ async def _on_payment_failed(db: AsyncIOMotorDatabase, invoice: Any) -> None:
     )
     tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "past_due", tier, existing.get("current_period_end"))
+    await notification_service.create_payment_failed_notification(db, company_id)
     logger.info("payment.failed.done company_id=%s", company_id)

@@ -1,20 +1,16 @@
 from typing import List, Any
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from jose import JWTError, jwt
 from bson import ObjectId
-from pydantic import BaseModel
 
 from database import get_database
 from config import settings
-from services import lead_service
-from schemas.lead_schema import LeadResponse
+from services import notification_service
+from schemas.notification_schema import NotificationResponse
 
+router = APIRouter(prefix="/notifications", tags=["Notifications"])
 
-class ContactedUpdate(BaseModel):
-    is_contacted: bool
-
-router = APIRouter(prefix="/leads", tags=["Leads"])
 
 async def get_current_user(
     db: AsyncIOMotorDatabase = Depends(get_database),
@@ -42,51 +38,45 @@ async def get_current_user(
     if not user:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
 
-    return {
-        "id": str(user["_id"]),
-        "email": user.get("email", ""),
-        "company_name": user.get("company_name", ""),
-    }
+    return {"id": str(user["_id"])}
 
-@router.get("/", response_model=List[LeadResponse])
-async def get_leads(
+
+@router.get("/", response_model=List[NotificationResponse])
+async def list_notifications(
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Fetch all leads for the current authenticated user's company."""
-    await lead_service.maybe_generate_lead_summaries(db, current_user["id"])
-    return await lead_service.get_leads_by_company(db, current_user["id"])
+    """Recent notifications for the current user's company, newest first."""
+    return await notification_service.get_notifications(db, current_user["id"])
 
-@router.get("/search", response_model=List[LeadResponse])
-async def search_leads(
-    q: str = Query(default=""),
+
+@router.get("/unread-count")
+async def unread_count(
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Search the current user's leads by name, email, or phone — for the dashboard's global search bar."""
-    return await lead_service.search_leads(db, current_user["id"], q)
+    """Lightweight endpoint for the topbar bell badge — poll this frequently."""
+    count = await notification_service.get_unread_count(db, current_user["id"])
+    return {"count": count}
 
-@router.delete("/{lead_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_lead(
-    lead_id: str,
+
+@router.post("/read-all")
+async def read_all(
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Delete a lead belonging to the current user."""
-    if not await lead_service.delete_lead(db, lead_id, current_user["id"]):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+    """Mark every notification as read — call this when the bell dropdown is opened."""
+    modified = await notification_service.mark_all_read(db, current_user["id"])
+    return {"modified": modified}
 
-@router.post("/{lead_id}/contacted", response_model=LeadResponse)
-async def update_lead_contacted(
-    lead_id: str,
-    payload: ContactedUpdate,
+
+@router.post("/{notification_id}/read", response_model=NotificationResponse)
+async def read_one(
+    notification_id: str,
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
-    """Mark a lead as contacted/uncontacted (read/unread style checkbox)."""
-    updated = await lead_service.set_lead_contacted(
-        db, lead_id, current_user["id"], payload.is_contacted,
-    )
+    updated = await notification_service.mark_one_read(db, current_user["id"], notification_id)
     if not updated:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Notification not found")
     return updated

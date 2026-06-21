@@ -190,6 +190,49 @@ async def get_visitor_stats(company_id: str) -> dict:
     }
 
 
+# ── lead categories ───────────────────────────────────────────────────────────
+
+async def get_lead_categories(company_id: str, limit: int = 8) -> list[dict]:
+    """
+    Groups leads by their captured inquiry type (e.g. "car accident",
+    "slip and fall") so the dashboard can show what kinds of cases/business
+    visitors are actually asking about.
+
+    Excludes long free-text values: once a lead's chat session crosses
+    lead_service.CONVERSATION_THRESHOLD turns, `message` gets overwritten
+    with a full AI-generated summary sentence instead of a short inquiry
+    label. Anything over 5 words is filtered out as noise rather than
+    counted as its own one-off "category".
+    """
+    db = get_database()
+    rows = await db["leads"].aggregate([
+        {"$match": {
+            "company_id": company_id,
+            "message": {"$nin": [None, ""]},
+        }},
+        {"$project": {
+            "clean_message": {"$trim": {"input": "$message"}},
+        }},
+        {"$project": {
+            "clean_message": 1,
+            "word_count": {"$size": {"$split": ["$clean_message", " "]}},
+        }},
+        {"$match": {"word_count": {"$lte": 5}}},
+        {"$group": {
+            "_id":   {"$toLower": "$clean_message"},
+            "count": {"$sum": 1},
+        }},
+        {"$sort": {"count": -1}},
+        {"$limit": limit},
+    ]).to_list(limit)
+
+    return [
+        {"category": row["_id"].title(), "count": row["count"]}
+        for row in rows
+        if row.get("_id")
+    ]
+
+
 # ── recent sessions ───────────────────────────────────────────────────────────
 
 async def get_recent_sessions(company_id: str, limit: int = 5) -> list[dict]:

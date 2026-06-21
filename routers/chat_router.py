@@ -18,9 +18,11 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from jose import JWTError, jwt
 from pydantic import BaseModel
+from pymongo import ReturnDocument
 
 from config import settings
 from database import get_database
+from services import notification_service
 from services.chatbot import (
     build_company_agent,
     get_cached_tool_names,
@@ -702,6 +704,11 @@ async def _persist_exchange(
             op, company_id, session_id, tools_used,
         )
 
+        if op == "inserted":
+            # Brand-new chat session — notify regardless of whether a lead
+            # (contact info) is ever captured during this conversation.
+            await notification_service.create_chat_notification(db, company_id, session_id)
+
         # ── 5. Upsert into the `leads` collection only when a contact method exists ─
         # A name alone is not actionable — only write to `leads` once we have
         # phone or email so the dashboard doesn't show incomplete lead records.
@@ -725,7 +732,7 @@ async def _persist_exchange(
             if effective_inquiry:
                 lead_set["message"] = effective_inquiry
 
-            await db["leads"].update_one(
+            existing_lead = await db["leads"].find_one_and_update(
                 {"company_id": company_id, "session_id": session_id},
                 {
                     "$set": lead_set,
@@ -737,11 +744,26 @@ async def _persist_exchange(
                     },
                 },
                 upsert=True,
+                return_document=ReturnDocument.BEFORE,
             )
             logger.info(
                 "chat.lead.upserted company_id=%s session_id=%s",
                 company_id, session_id,
             )
+
+            if existing_lead is None:
+                # This was a brand-new lead (not an update to an existing one) — notify.
+                new_lead = await db["leads"].find_one(
+                    {"company_id": company_id, "session_id": session_id},
+                )
+                if new_lead:
+                    await notification_service.create_lead_notification(
+                        db,
+                        company_id,
+                        str(new_lead["_id"]),
+                        new_lead.get("name"),
+                        new_lead.get("email") or new_lead.get("phone"),
+                    )
 
     except Exception as exc:
         # Never let a persistence failure break the chat reply

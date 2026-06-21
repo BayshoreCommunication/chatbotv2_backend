@@ -8,6 +8,7 @@ Endpoints:
   GET /dashboard/{company_id}/chart            — Chat/lead time-series for bar/line chart
   GET /dashboard/{company_id}/visitors         — Unique visitor stats
   GET /dashboard/{company_id}/recent-sessions  — Last N session previews
+  GET /dashboard/{company_id}/lead-categories  — Leads grouped by inquiry type
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 
 from services.dashboard_service import (
     get_chat_chart,
+    get_lead_categories,
     get_recent_sessions,
     get_summary,
     get_visitor_stats,
@@ -95,5 +97,23 @@ async def dashboard_recent_sessions(
     """
     try:
         return await get_recent_sessions(company_id, limit)
+    except Exception as exc:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
+
+
+# ── GET /dashboard/{company_id}/lead-categories ──────────────────────────────
+
+@router.get("/{company_id}/lead-categories", summary="Leads grouped by inquiry type")
+async def dashboard_lead_categories(
+    company_id: str,
+    limit: int = Query(default=8, ge=1, le=20),
+):
+    """
+    Returns the most common inquiry types captured from leads, e.g.
+    [{"category": "Car Accident", "count": 18}, ...] — shows the business
+    owner what their visitors actually need most.
+    """
+    try:
+        return await get_lead_categories(company_id, limit)
     except Exception as exc:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))

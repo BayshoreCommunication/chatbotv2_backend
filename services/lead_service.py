@@ -1,4 +1,5 @@
 import logging
+import re
 from datetime import datetime
 from typing import List, Optional
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -30,6 +31,29 @@ def serialize_lead(lead: dict) -> dict:
 async def get_leads_by_company(db: AsyncIOMotorDatabase, company_id: str) -> List[dict]:
     """Fetch all leads for a specific company, sorted by newest first."""
     cursor = db["leads"].find({"company_id": company_id}).sort("created_at", -1)
+    return [serialize_lead(lead) async for lead in cursor]
+
+async def search_leads(
+    db: AsyncIOMotorDatabase, company_id: str, query: str, limit: int = 5,
+) -> List[dict]:
+    """Search this company's leads by name, email, or phone — for the dashboard's global search bar."""
+    query = query.strip()
+    if not query:
+        return []
+    pattern = re.escape(query)
+    cursor = (
+        db["leads"]
+        .find({
+            "company_id": company_id,
+            "$or": [
+                {"name":  {"$regex": pattern, "$options": "i"}},
+                {"email": {"$regex": pattern, "$options": "i"}},
+                {"phone": {"$regex": pattern, "$options": "i"}},
+            ],
+        })
+        .sort("created_at", -1)
+        .limit(limit)
+    )
     return [serialize_lead(lead) async for lead in cursor]
 
 async def delete_lead(db: AsyncIOMotorDatabase, lead_id: str, company_id: str) -> bool:

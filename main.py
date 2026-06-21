@@ -18,6 +18,7 @@ from routers import (
     subscription_router,
     billing_router,
     dashboard_router,
+    notification_router,
 )
 from routers.chat_router import widget_router
 
@@ -71,6 +72,7 @@ app.include_router(widget_router,                   prefix="/api")
 app.include_router(subscription_router.router,      prefix="/api/v1")
 app.include_router(billing_router.router,           prefix="/api/v1")
 app.include_router(dashboard_router.router,         prefix="/api/v1")
+app.include_router(notification_router.router,      prefix="/api/v1")
 
 
 @app.get("/", tags=["Health"])
