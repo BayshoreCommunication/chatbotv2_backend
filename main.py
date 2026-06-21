@@ -16,6 +16,7 @@ from routers import (
     widget_settings,
     upload_router,
     subscription_router,
+    billing_router,
     dashboard_router,
 )
 from routers.chat_router import widget_router
@@ -68,6 +69,7 @@ app.include_router(widget_settings.router, prefix="/api/v1")
 app.include_router(upload_router.router,   prefix="/api/v1")
 app.include_router(widget_router,                   prefix="/api")
 app.include_router(subscription_router.router,      prefix="/api/v1")
+app.include_router(billing_router.router,           prefix="/api/v1")
 app.include_router(dashboard_router.router,         prefix="/api/v1")
 
 

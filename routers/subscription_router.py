@@ -3,11 +3,13 @@ routers/subscription_router.py
 ────────────────────────────────
 Subscription endpoints.
 
-  POST /subscription/checkout/{company_id}   — create Stripe Checkout session
-  POST /subscription/portal/{company_id}     — create Stripe billing portal session
-  POST /subscription/cancel/{company_id}     — cancel subscription
-  GET  /subscription/{company_id}            — get current subscription status
-  POST /subscription/webhook                 — Stripe webhook receiver (raw body)
+  POST /subscription/checkout/{company_id}     — create Stripe Checkout session (legacy redirect flow)
+  POST /subscription/create/{company_id}       — custom signup (Stripe Elements, no redirect)
+  POST /subscription/change-plan/{company_id}  — switch plan directly (existing card on file)
+  POST /subscription/portal/{company_id}       — create Stripe billing portal session
+  POST /subscription/cancel/{company_id}       — cancel subscription
+  GET  /subscription/{company_id}              — get current subscription status
+  POST /subscription/webhook                   — Stripe webhook receiver (raw body)
 """
 
 from __future__ import annotations
@@ -24,8 +26,10 @@ from database import get_database
 from model.subscription_model import SubscriptionResponse
 from services.subscription.subscription_service import (
     cancel_subscription,
+    change_subscription_plan,
     create_checkout_session,
     create_portal_session,
+    create_subscription_intent,
     get_subscription,
     handle_webhook_event,
 )
@@ -37,10 +41,23 @@ logger = logging.getLogger(__name__)
 # ── Request / Response schemas ────────────────────────────────────────────────
 
 class CheckoutRequest(BaseModel):
-    tier:         str = "professional"   # free | professional | enterprise
+    # free | professional | advanced — "enterprise" is custom-priced and not
+    # purchasable here; it always normalizes to "advanced" (see
+    # subscription_service._LEGACY_TIER_ALIASES).
+    tier:         str = "professional"
     billing_cycle: str = "monthly"       # monthly | annual
     success_url:  str
     cancel_url:   str
+
+
+class CreateSubscriptionRequest(BaseModel):
+    tier:          str = "professional"
+    billing_cycle: str = "monthly"
+
+
+class ChangePlanRequest(BaseModel):
+    tier:          str = "professional"
+    billing_cycle: str = "monthly"
 
 
 class PortalRequest(BaseModel):
@@ -87,6 +104,48 @@ async def checkout(
     )
     _raise_service_error(result)
     return result   # {"checkout_url": "https://checkout.stripe.com/..."}
+
+
+# ── POST /subscription/create/{company_id} ───────────────────────────────────
+
+@router.post(
+    "/create/{company_id}",
+    summary="Start a custom signup — returns a PaymentIntent client_secret for Stripe Elements",
+)
+async def create_subscription(
+    company_id: str,
+    payload: CreateSubscriptionRequest,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    result = await create_subscription_intent(
+        db=db,
+        company_id=company_id,
+        tier=payload.tier,
+        billing_cycle=payload.billing_cycle,
+    )
+    _raise_service_error(result)
+    return result   # {"subscription_id", "client_secret", "requires_payment"}
+
+
+# ── POST /subscription/change-plan/{company_id} ──────────────────────────────
+
+@router.post(
+    "/change-plan/{company_id}",
+    summary="Switch plan directly using the saved payment method (no Checkout redirect)",
+)
+async def change_plan(
+    company_id: str,
+    payload: ChangePlanRequest,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    result = await change_subscription_plan(
+        db=db,
+        company_id=company_id,
+        tier=payload.tier,
+        billing_cycle=payload.billing_cycle,
+    )
+    _raise_service_error(result)
+    return result   # {"ok", "requires_payment", "client_secret"}
 
 
 # ── POST /subscription/portal/{company_id} ───────────────────────────────────

@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field
 SubscriptionTier = Literal[
     "free",
     "professional",
+    "advanced",
+    # "enterprise" is custom-priced (no fixed Stripe price) — negotiated
+    # directly with sales and set manually, not purchasable via checkout.
     "enterprise",
 ]
 
@@ -47,8 +50,29 @@ BillingCycle = Literal["monthly", "annual"]
 CONVERSATION_LIMITS: dict[SubscriptionTier, Optional[int]] = {
     "free":         1000,
     "professional": 5000,
-    "enterprise":   None,
+    "advanced":     None,   # unlimited
+    "enterprise":   None,   # unlimited (custom contract may override manually)
 }
+
+
+# ── Enterprise custom contract details ────────────────────────────────────────
+# Structured, typed record for the manually-negotiated "enterprise" tier —
+# kept separate from the free-form `metadata` dict (which stays for truly
+# arbitrary stuff like promo codes) so the deal terms stay queryable.
+
+class EnterpriseContractDetails(BaseModel):
+    contract_reference: Optional[str] = Field(
+        None, description="Internal deal/contract ID, e.g. from a CRM or signed agreement."
+    )
+    notes: Optional[str] = Field(
+        None, description="Free-text notes about the negotiated terms."
+    )
+    set_by: Optional[str] = Field(
+        None, description="Email or user ID of whoever configured this custom plan."
+    )
+    set_at: Optional[datetime] = Field(
+        None, description="When this custom plan was configured."
+    )
 
 
 # ── Main Document Model ───────────────────────────────────────────────────────
@@ -111,6 +135,15 @@ class SubscriptionModel(BaseModel):
     ended_at: Optional[datetime] = Field(
         None, description="When the subscription actually ended after cancel_at_period_end."
     )
+    collection_method: Literal["charge_automatically", "send_invoice"] = Field(
+        "charge_automatically",
+        description=(
+            "Mirrors Stripe Subscription.collection_method. 'charge_automatically' "
+            "bills the default payment method each period; 'send_invoice' requires "
+            "the customer to pay each invoice manually. Backs the dashboard's "
+            "'Automatic Payments' toggle via stripe.Subscription.modify(...)."
+        ),
+    )
 
     # ── Billing Period ────────────────────────────────────────────────────────
     current_period_start: Optional[datetime] = Field(
@@ -127,6 +160,16 @@ class SubscriptionModel(BaseModel):
     # ── Timestamps ────────────────────────────────────────────────────────────
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+
+    # ── Enterprise custom contract ───────────────────────────────────────────
+    enterprise_contract: Optional[EnterpriseContractDetails] = Field(
+        None,
+        description=(
+            "Populated only when subscription_tier == 'enterprise'. "
+            "Structured record of the custom-priced contract, set manually "
+            "by an admin after a sales negotiation."
+        ),
+    )
 
     # ── Free-form extras ──────────────────────────────────────────────────────
     metadata: dict[str, Any] = Field(
@@ -170,6 +213,7 @@ class SubscriptionResponse(BaseModel):
     payment_amount:         float
     currency:               str
     cancel_at_period_end:   bool
+    collection_method:      Literal["charge_automatically", "send_invoice"] = "charge_automatically"
     current_period_start:   Optional[datetime]
     current_period_end:     Optional[datetime]
     trial_end:              Optional[datetime]

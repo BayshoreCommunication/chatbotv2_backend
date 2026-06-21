@@ -3,11 +3,16 @@ from fastapi import APIRouter, Depends, HTTPException, status, Header
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from jose import JWTError, jwt
 from bson import ObjectId
+from pydantic import BaseModel
 
 from database import get_database
 from config import settings
 from services import lead_service
 from schemas.lead_schema import LeadResponse
+
+
+class ContactedUpdate(BaseModel):
+    is_contacted: bool
 
 router = APIRouter(prefix="/leads", tags=["Leads"])
 
@@ -49,6 +54,7 @@ async def get_leads(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     """Fetch all leads for the current authenticated user's company."""
+    await lead_service.maybe_generate_lead_summaries(db, current_user["id"])
     return await lead_service.get_leads_by_company(db, current_user["id"])
 
 @router.delete("/{lead_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -60,3 +66,18 @@ async def delete_lead(
     """Delete a lead belonging to the current user."""
     if not await lead_service.delete_lead(db, lead_id, current_user["id"]):
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+
+@router.post("/{lead_id}/contacted", response_model=LeadResponse)
+async def update_lead_contacted(
+    lead_id: str,
+    payload: ContactedUpdate,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    """Mark a lead as contacted/uncontacted (read/unread style checkbox)."""
+    updated = await lead_service.set_lead_contacted(
+        db, lead_id, current_user["id"], payload.is_contacted,
+    )
+    if not updated:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Lead not found")
+    return updated

@@ -19,24 +19,31 @@ from model.subscription_model import CONVERSATION_LIMITS
 
 logger = logging.getLogger(__name__)
 
+# "enterprise" has no fixed price here — it's custom-priced and negotiated
+# directly with sales (see create_checkout_session, which rejects self-serve
+# checkout for that tier with a "contact_sales" error).
 PRICE_MAP: dict[str, str] = {
     "free:monthly":          "price_1RyxWWFS3P7wS29bZsXvMCOR",
     "free:annual":           "price_1RyxWWFS3P7wS29bZsXvMCOR",
     "professional:monthly":  "price_1RyxVtFS3P7wS29b940JDA7E",
     "professional:annual":   "price_1SRPfGFS3P7wS29b1LEGA6HR",
-    "enterprise:monthly":    "price_1RyxUsFS3P7wS29bjiaTZag4",
-    "enterprise:annual":     "price_1SRPh0FS3P7wS29bfAjG9QGZ",
+    "advanced:monthly":      "price_1RyxUsFS3P7wS29bjiaTZag4",
+    "advanced:annual":       "price_1SRPh0FS3P7wS29bfAjG9QGZ",
 }
 
 PLAN_TRAIN_LIMITS: dict[str, int] = {
     "free":         5,
     "professional": 20,
-    "enterprise":   100,
+    "advanced":     100,
+    "enterprise":   100,   # custom contract may override manually
 }
 
-# "starter" was renamed to "free" — normalize old tier values found in
-# existing Stripe metadata / subscription docs onto the new name.
-_LEGACY_TIER_ALIASES: dict[str, str] = {"starter": "free"}
+# "starter" was renamed to "free", and the old fixed-price "enterprise" tier
+# ($99/999, price IDs above) was renamed to "advanced" — "enterprise" now
+# means the new custom-priced, contact-sales-only tier. Normalize old tier
+# values found in existing Stripe metadata / subscription docs onto the
+# current names.
+_LEGACY_TIER_ALIASES: dict[str, str] = {"starter": "free", "enterprise": "advanced"}
 
 
 def _normalize_tier(tier: str | None) -> str:
@@ -191,6 +198,84 @@ async def _sync_users_doc(
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+async def create_subscription_intent(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    tier: str,
+    billing_cycle: str,
+) -> dict:
+    """
+    Fully custom signup flow for a brand-new subscriber with no payment
+    method on file yet. Creates the Stripe customer (if needed) and a
+    Subscription in 'default_incomplete' state, returning a PaymentIntent
+    client_secret that the frontend confirms via Stripe Elements
+    (PaymentElement) — no redirect to Stripe Checkout.
+
+    For a free ($0) plan, Stripe finalizes the invoice with nothing to
+    charge, so there's no payment_intent — the caller should treat
+    requires_payment=False as already-complete and just wait for the
+    webhook to sync MongoDB.
+
+    Existing subscribers switching plans should use
+    change_subscription_plan instead, which reuses their saved card.
+    """
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    tier = _normalize_tier(tier)
+    logger.info("subscription.create_intent.start company_id=%s tier=%s cycle=%s", company_id, tier, billing_cycle)
+
+    price_key = f"{tier}:{billing_cycle}"
+    price_id  = PRICE_MAP.get(price_key)
+    if not price_id:
+        logger.error("subscription.create_intent.invalid_plan key=%s", price_key)
+        return {"error": "invalid_plan", "detail": f"Unknown plan: {price_key}"}
+
+    existing    = await db["subscriptions"].find_one({"company_id": company_id}, {"stripe_customer_id": 1})
+    customer_id = (existing or {}).get("stripe_customer_id")
+
+    try:
+        if not customer_id:
+            user = await db["users"].find_one({"_id": _to_object_id(company_id)}, {"email": 1})
+            customer = stripe.Customer.create(
+                email=(user or {}).get("email"),
+                metadata={"company_id": company_id},
+            )
+            customer_id = customer.id
+            logger.info(
+                "subscription.create_intent.customer_created company_id=%s customer_id=%s",
+                company_id, customer_id,
+            )
+
+        subscription = stripe.Subscription.create(
+            customer=customer_id,
+            items=[{"price": price_id}],
+            payment_behavior="default_incomplete",
+            payment_settings={"save_default_payment_method": "on_subscription"},
+            expand=["latest_invoice.confirmation_secret"],
+            metadata={"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
+        )
+
+        # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
+        # from Invoice objects (to support partial payments) — the
+        # replacement is `confirmation_secret`, which gives the client_secret
+        # directly without needing a separate PaymentIntent lookup.
+        latest_invoice = subscription.latest_invoice
+        confirmation_secret = getattr(latest_invoice, "confirmation_secret", None) if latest_invoice else None
+        client_secret = getattr(confirmation_secret, "client_secret", None) if confirmation_secret else None
+
+        logger.info(
+            "subscription.create_intent.ok company_id=%s tier=%s sub_id=%s requires_payment=%s",
+            company_id, tier, subscription.id, bool(client_secret),
+        )
+        return {
+            "subscription_id":  subscription.id,
+            "client_secret":    client_secret,
+            "requires_payment": bool(client_secret),
+        }
+    except stripe.StripeError as e:
+        logger.error("subscription.create_intent.stripe_error company_id=%s error=%s", company_id, e)
+        return {"error": "stripe_error", "detail": str(e)}
+
+
 async def create_checkout_session(
     db: AsyncIOMotorDatabase,
     company_id: str,
@@ -199,6 +284,12 @@ async def create_checkout_session(
     success_url: str,
     cancel_url: str,
 ) -> dict:
+    """
+    Note: tier="enterprise" always normalizes to "advanced" here (see
+    _LEGACY_TIER_ALIASES) and there is intentionally no PRICE_MAP entry for
+    the real "enterprise" tier — it's custom-priced and set manually after a
+    sales conversation, never purchasable through self-serve checkout.
+    """
     stripe.api_key = settings.STRIPE_SECRET_KEY
     tier = _normalize_tier(tier)
     logger.info("subscription.checkout.start company_id=%s tier=%s cycle=%s", company_id, tier, billing_cycle)
@@ -236,6 +327,115 @@ async def create_checkout_session(
         return {"checkout_url": session.url}
     except stripe.StripeError as e:
         logger.error("subscription.checkout.stripe_error company_id=%s error=%s", company_id, e)
+        return {"error": "stripe_error", "detail": str(e)}
+
+
+async def change_subscription_plan(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    tier: str,
+    billing_cycle: str,
+) -> dict:
+    """
+    Switch plan for a company that already has a Stripe subscription
+    (including a free-tier one) — modifies the existing Subscription's
+    price directly via the API instead of creating a new subscription or
+    Checkout Session.
+
+    No prorated credit for unused time on the old plan: proration_behavior
+    is "none" and billing_cycle_anchor is reset to "now", so the customer
+    is billed the FULL new-plan price immediately and the next renewal is
+    exactly one cycle from today — switching plans is a fresh payment, not
+    a top-up of the difference.
+
+    Uses payment_behavior="default_incomplete" so Stripe tells us
+    explicitly what happened instead of us assuming a card is on file:
+      - If the customer already has a usable default payment method,
+        Stripe charges it immediately and the invoice is already "paid" —
+        requires_payment comes back False, nothing more for the frontend
+        to do.
+      - If there's no payment method yet (e.g. upgrading straight from a
+        card-less free trial), Stripe creates an invoice that needs
+        confirmation — requires_payment comes back True with a
+        client_secret, and the frontend shows the same Stripe Elements
+        form used for brand-new signups.
+
+    create_subscription_intent (below) is only for a company with no
+    Stripe subscription at all yet.
+    """
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+    tier = _normalize_tier(tier)
+    logger.info("subscription.change_plan.start company_id=%s tier=%s cycle=%s", company_id, tier, billing_cycle)
+
+    price_key = f"{tier}:{billing_cycle}"
+    price_id  = PRICE_MAP.get(price_key)
+    if not price_id:
+        logger.error("subscription.change_plan.invalid_plan key=%s", price_key)
+        return {"error": "invalid_plan", "detail": f"Unknown plan: {price_key}"}
+
+    existing = await db["subscriptions"].find_one({"company_id": company_id})
+    if not existing or not existing.get("stripe_subscription_id"):
+        return {"error": "no_subscription", "detail": "No active subscription found."}
+
+    sub_id = existing["stripe_subscription_id"]
+    try:
+        sub = stripe.Subscription.retrieve(sub_id)
+
+        if sub.status in ("incomplete", "incomplete_expired"):
+            # The existing subscription was never actually paid for (the
+            # customer abandoned the initial payment) — Stripe blocks any
+            # item/price change on an "incomplete" subscription with "Only
+            # minor attributes ... can be updated". Nothing to switch FROM
+            # since it was never active, so cancel the stuck one and start
+            # fresh with the new plan instead.
+            logger.warning(
+                "subscription.change_plan.incomplete_sub_replacing company_id=%s old_sub_id=%s",
+                company_id, sub_id,
+            )
+            try:
+                stripe.Subscription.cancel(sub_id)
+            except stripe.StripeError as cancel_err:
+                logger.warning(
+                    "subscription.change_plan.cancel_incomplete_failed sub_id=%s error=%s",
+                    sub_id, cancel_err,
+                )
+            return await create_subscription_intent(db, company_id, tier, billing_cycle)
+
+        item_id = sub["items"]["data"][0]["id"]
+        updated = stripe.Subscription.modify(
+            sub_id,
+            items=[{"id": item_id, "price": price_id}],
+            proration_behavior="none",
+            billing_cycle_anchor="now",
+            payment_behavior="default_incomplete",
+            expand=["latest_invoice.confirmation_secret"],
+            metadata={"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
+        )
+
+        # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
+        # from Invoice objects — `confirmation_secret` is the replacement and
+        # gives the client_secret directly. If the invoice already paid
+        # automatically (valid default payment method on file), its status
+        # is "paid" and there's nothing left for the frontend to confirm.
+        latest_invoice = updated.latest_invoice
+        invoice_status = getattr(latest_invoice, "status", None) if latest_invoice else None
+        confirmation_secret = getattr(latest_invoice, "confirmation_secret", None) if latest_invoice else None
+        client_secret = getattr(confirmation_secret, "client_secret", None) if confirmation_secret else None
+        requires_payment = bool(client_secret) and invoice_status != "paid"
+
+        logger.info(
+            "subscription.change_plan.ok company_id=%s tier=%s cycle=%s sub_id=%s requires_payment=%s",
+            company_id, tier, billing_cycle, sub_id, requires_payment,
+        )
+        # The customer.subscription.updated webhook will fire next and sync
+        # the new tier/price/period into MongoDB — no manual write needed here.
+        return {
+            "ok": True,
+            "requires_payment": requires_payment,
+            "client_secret": client_secret if requires_payment else None,
+        }
+    except stripe.StripeError as e:
+        logger.error("subscription.change_plan.stripe_error company_id=%s error=%s", company_id, e)
         return {"error": "stripe_error", "detail": str(e)}
 
 
