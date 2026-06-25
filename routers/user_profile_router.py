@@ -39,6 +39,7 @@ def _serialize_profile(user: dict[str, Any]) -> dict[str, Any]:
         "website": user.get("company_website"),
         "avatar": user.get("avatar"),
         "email": user.get("email", ""),
+        "phoneNumber": user.get("phone_number", ""),
         "role": user.get("role", "organization"),
         "is_subscribed": user.get("is_subscribed", False),
         "has_paid_subscription": user.get("has_paid_subscription", False),

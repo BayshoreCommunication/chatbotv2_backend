@@ -515,8 +515,11 @@ async def conversation_history(
     company_id: str,
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
+    auth_company_id: str = Depends(_require_dashboard_auth),
 ):
     """Return paginated conversation history for a company from `chat_sessions`."""
+    if auth_company_id != company_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied.")
     ctx = await get_company_context(company_id)
     if ctx is None:
         raise HTTPException(

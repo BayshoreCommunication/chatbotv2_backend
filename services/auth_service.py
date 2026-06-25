@@ -1,5 +1,6 @@
 import logging
 import random
+import secrets
 import string
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -11,8 +12,8 @@ from bson import ObjectId
 from config import settings
 from services.user_service import hash_password, verify_password, serialize_user
 from model.user_model import UserModel
-from schemas.user import SignupRequest, OTPVerifyRequest, SigninRequest
-from utils.email import send_otp_email
+from schemas.user import SignupRequest, OTPVerifyRequest, SigninRequest, LoginOTPRequest, LoginOTPVerifyRequest
+from utils.email import send_otp_email, send_login_otp_email
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,11 @@ async def signup(db: AsyncIOMotorDatabase, payload: SignupRequest) -> dict:
     otp = _generate_otp()
     otp_expires = datetime.now(timezone.utc) + timedelta(minutes=10)
 
+    # Password is optional from the client — generate one if not supplied so
+    # the account still has credentials (e.g. for the auto sign-in after
+    # OTP verification below).
+    password = payload.password or secrets.token_urlsafe(16)
+
     # Upsert into temp_signups (replace if same email tries again)
     await db["temp_signups"].replace_one(
         {"email": payload.email},
@@ -47,8 +53,9 @@ async def signup(db: AsyncIOMotorDatabase, payload: SignupRequest) -> dict:
             "company_name": payload.company_name,
             "company_type": payload.company_type,
             "company_website": payload.company_website,
+            "phone_number": payload.phone_number,
             "email": payload.email,
-            "hashed_password": hash_password(payload.password),
+            "hashed_password": hash_password(password),
             "otp_code": otp,
             "otp_expires_at": otp_expires,
             "created_at": datetime.now(timezone.utc),
@@ -99,6 +106,7 @@ async def verify_otp(db: AsyncIOMotorDatabase, payload: OTPVerifyRequest) -> dic
         company_name=temp["company_name"],
         company_type=temp["company_type"],
         company_website=temp.get("company_website"),
+        phone_number=temp.get("phone_number"),
         email=temp["email"],
         hashed_password=temp["hashed_password"],
         is_verified=True,
@@ -144,6 +152,86 @@ async def signin(db: AsyncIOMotorDatabase, payload: SigninRequest) -> dict:
 
     if not user.get("is_active", True):
         return {"error": "account_disabled"}
+
+    token = create_access_token({
+        "sub": str(user["_id"]),
+        "email": user["email"],
+        "role": user["role"],
+    })
+
+    return {
+        "access_token":       token,
+        "token_type":         "bearer",
+        "user_id":            str(user["_id"]),
+        "company_name":       user["company_name"],
+        "role":               user["role"],
+        "has_paid_subscription": bool(user.get("has_paid_subscription", False)),
+        "subscription_type":  user.get("subscription_type", "free"),
+    }
+
+
+# ── Passwordless sign-in: request OTP ─────────────────────────────────────────
+
+async def request_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPRequest) -> dict:
+    """Email a 6-digit sign-in code to an existing, verified, active account."""
+
+    user = await db["users"].find_one({"email": payload.email})
+    if not user:
+        return {"error": "account_not_found"}
+    if not user.get("is_verified"):
+        return {"error": "email_not_verified"}
+    if not user.get("is_active", True):
+        return {"error": "account_disabled"}
+
+    otp = _generate_otp()
+    otp_expires = datetime.now(timezone.utc) + timedelta(minutes=10)
+
+    await db["users"].update_one(
+        {"_id": user["_id"]},
+        {"$set": {"otp_code": otp, "otp_expires_at": otp_expires}},
+    )
+
+    try:
+        await send_login_otp_email(
+            to_email=payload.email,
+            company_name=user["company_name"],
+            otp=otp,
+        )
+    except Exception as e:
+        logger.error("Failed to send login OTP email to %s: %s", payload.email, e, exc_info=True)
+        return {"error": "email_send_failed", "detail": str(e)}
+
+    return {"message": f"A sign-in code has been sent to {payload.email}."}
+
+
+# ── Passwordless sign-in: verify OTP → JWT ────────────────────────────────────
+
+async def verify_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPVerifyRequest) -> dict:
+    """Validate the sign-in code and return a JWT bearer token, same shape as signin()."""
+
+    user = await db["users"].find_one({"email": payload.email})
+    if not user:
+        return {"error": "account_not_found"}
+
+    if not user.get("otp_code"):
+        return {"error": "otp_not_requested"}
+    if user.get("otp_code") != payload.otp_code:
+        return {"error": "invalid_otp"}
+
+    otp_expires_at = user.get("otp_expires_at", datetime.now(timezone.utc))
+    if otp_expires_at.tzinfo is None:
+        otp_expires_at = otp_expires_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) > otp_expires_at:
+        return {"error": "otp_expired"}
+
+    if not user.get("is_active", True):
+        return {"error": "account_disabled"}
+
+    # One-time use — clear it so the same code can't be replayed.
+    await db["users"].update_one(
+        {"_id": user["_id"]},
+        {"$set": {"otp_code": None, "otp_expires_at": None}},
+    )
 
     token = create_access_token({
         "sub": str(user["_id"]),

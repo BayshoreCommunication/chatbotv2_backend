@@ -2,7 +2,14 @@ from fastapi import APIRouter, HTTPException, status, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from database import get_database
-from schemas.user import SignupRequest, OTPVerifyRequest, SigninRequest, TokenResponse
+from schemas.user import (
+    SignupRequest,
+    OTPVerifyRequest,
+    SigninRequest,
+    TokenResponse,
+    LoginOTPRequest,
+    LoginOTPVerifyRequest,
+)
 from services import auth_service
 
 router = APIRouter(prefix="/auth", tags=["Auth"])
@@ -16,6 +23,8 @@ ERROR_MAP = {
     "invalid_credentials": (status.HTTP_401_UNAUTHORIZED,   "Invalid email or password."),
     "email_not_verified":  (status.HTTP_403_FORBIDDEN,      "Please verify your email before signing in."),
     "account_disabled":    (status.HTTP_403_FORBIDDEN,      "Your account has been disabled."),
+    "account_not_found":   (status.HTTP_404_NOT_FOUND,      "No account found with this email."),
+    "otp_not_requested":   (status.HTTP_400_BAD_REQUEST,    "Request a sign-in code first."),
 }
 
 
@@ -55,5 +64,27 @@ async def signin(payload: SigninRequest, db: AsyncIOMotorDatabase = Depends(get_
     Returns a JWT bearer token valid for use in all protected endpoints.
     """
     result = await auth_service.signin(db, payload)
+    raise_if_error(result)
+    return result
+
+
+@router.post("/request-login-otp", summary="Request a passwordless sign-in code")
+async def request_login_otp(payload: LoginOTPRequest, db: AsyncIOMotorDatabase = Depends(get_database)):
+    """
+    Step 1 of passwordless sign-in — sends a 6-digit code to an existing,
+    verified, active account's email.
+    """
+    result = await auth_service.request_login_otp(db, payload)
+    raise_if_error(result)
+    return result
+
+
+@router.post("/verify-login-otp", response_model=TokenResponse, summary="Verify sign-in code and get JWT token")
+async def verify_login_otp(payload: LoginOTPVerifyRequest, db: AsyncIOMotorDatabase = Depends(get_database)):
+    """
+    Step 2 of passwordless sign-in — confirm the 6-digit code.
+    Returns a JWT bearer token valid for use in all protected endpoints.
+    """
+    result = await auth_service.verify_login_otp(db, payload)
     raise_if_error(result)
     return result

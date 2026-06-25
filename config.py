@@ -43,5 +43,9 @@ class Settings(BaseSettings):
     DO_SPACES_CDN_URL: str = ""
     DO_FOLDER_NAME: str = "uploads"
 
+    # ── Super Admin (fixed account, seeded at startup) ───────────────────────
+    SUPER_ADMIN_EMAIL: str = "superadmin@gmail.com"
+    SUPER_ADMIN_PASSWORD: str = "superadmin@123"
+
 
 settings = Settings()

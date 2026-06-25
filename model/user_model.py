@@ -47,6 +47,7 @@ class UserModel(BaseModel):
     company_name: str = Field(..., min_length=2, max_length=150)
     company_type: CompanyType = "other"
     company_website: Optional[str] = None
+    phone_number: Optional[str] = None
 
     # ── Auth ──────────────────────────────────────────────────────────────────
     email: EmailStr

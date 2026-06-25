@@ -31,8 +31,10 @@ class SignupRequest(BaseModel):
     company_name: str = Field(..., min_length=2, max_length=150)
     company_type: CompanyType = "other"
     company_website: str = Field(..., description="Company website URL")
+    phone_number: str = Field(..., description="Company contact phone number")
     email: EmailStr
-    password: str = Field(..., min_length=6)
+    # Optional — if omitted, the backend generates one (see auth_service.signup).
+    password: Optional[str] = Field(None, min_length=6)
 
 
 class OTPVerifyRequest(BaseModel):
@@ -43,6 +45,15 @@ class OTPVerifyRequest(BaseModel):
 class SigninRequest(BaseModel):
     email: EmailStr
     password: str
+
+
+class LoginOTPRequest(BaseModel):
+    email: EmailStr
+
+
+class LoginOTPVerifyRequest(BaseModel):
+    email: EmailStr
+    otp_code: str = Field(..., min_length=6, max_length=6)
 
 
 class TokenResponse(BaseModel):
@@ -59,6 +70,7 @@ class UserCreate(BaseModel):
     company_name: str = Field(..., min_length=2, max_length=150)
     company_type: CompanyType = "other"
     company_website: Optional[str] = None
+    phone_number: Optional[str] = None
     email: EmailStr
     password: str = Field(..., min_length=6)
     role: str = "organization"
@@ -68,6 +80,7 @@ class UserUpdate(BaseModel):
     company_name: Optional[str] = Field(None, min_length=2, max_length=150)
     company_type: Optional[CompanyType] = None
     company_website: Optional[str] = None
+    phone_number: Optional[str] = None
     email: Optional[EmailStr] = None
     password: Optional[str] = Field(None, min_length=6)
     role: Optional[str] = None
@@ -88,6 +101,7 @@ class UserResponse(BaseModel):
     company_name: str
     company_type: str
     company_website: Optional[str]
+    phone_number: Optional[str]
     email: str
     role: str
     is_active: bool

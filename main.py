@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from database import connect_to_mongo, close_mongo_connection
+from database import connect_to_mongo, close_mongo_connection, get_database
 from routers import (
     user_router,
     auth_router,
@@ -19,8 +19,10 @@ from routers import (
     billing_router,
     dashboard_router,
     notification_router,
+    admin_route,
 )
 from routers.chat_router import widget_router
+from services.admin.admin_auth import seed_super_admin
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -40,6 +42,7 @@ logging.getLogger("watchfiles").setLevel(logging.WARNING)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
+    await seed_super_admin(get_database())
     yield
     await close_mongo_connection()
 
@@ -73,6 +76,7 @@ app.include_router(subscription_router.router,      prefix="/api/v1")
 app.include_router(billing_router.router,           prefix="/api/v1")
 app.include_router(dashboard_router.router,         prefix="/api/v1")
 app.include_router(notification_router.router,      prefix="/api/v1")
+app.include_router(admin_route.router,              prefix="/api/v1")
 
 
 @app.get("/", tags=["Health"])
