@@ -17,7 +17,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -146,6 +146,7 @@ async def extract_knowledge(
     company_type: str,
     crawled_pages: list[dict],
     search_results: list[dict],
+    on_batch_done: Optional[Callable[[str, list[dict]], Awaitable[None]]] = None,
 ) -> list[dict]:
     """
     Batched + concurrent LLM extraction.
@@ -155,6 +156,10 @@ async def extract_knowledge(
     run concurrently with asyncio.gather (capped at MAX_CONCURRENT).
 
     This reduces 30 sequential calls (~5 min) to ~6 concurrent batches (~30s).
+
+    `on_batch_done`, if given, is called with (source_label, entries_found)
+    right after each batch resolves — purely an observer hook for live
+    progress reporting, does not affect what gets extracted.
     """
     all_entries: list[dict] = []
     seen_keys: set[str] = set()
@@ -211,6 +216,8 @@ async def extract_knowledge(
                 "extractor.batch_done company=%s batch=%d/%d entries=%d",
                 company_name, idx + 1, total_batches, len(result),
             )
+            if on_batch_done:
+                await on_batch_done(label, result)
             return result
 
     batch_results = await asyncio.gather(
@@ -234,6 +241,8 @@ async def extract_knowledge(
             llm, company_name, company_type, search_text, "web_search"
         )
         _add_entries(entries)
+        if on_batch_done:
+            await on_batch_done("web_search", entries)
 
     fallback_entries = _extract_critical_fallback_entries(
         company_name=company_name,

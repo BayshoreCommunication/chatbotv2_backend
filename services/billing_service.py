@@ -63,15 +63,25 @@ def _serialize_payment_method(pm: Any, default_id: str | None) -> dict:
 
 
 def _serialize_invoice(invoice: Any) -> dict:
+    amount_due     = (getattr(invoice, "amount_due", 0) or 0) / 100
+    billing_reason = getattr(invoice, "billing_reason", None)
+    # A $0 "subscription_create" invoice is the trial-start invoice Stripe
+    # auto-pays immediately — it records the card collection, not a charge.
+    is_trial = amount_due == 0 and billing_reason == "subscription_create"
     return {
         "id":                  getattr(invoice, "id", None),
         "created":             getattr(invoice, "created", None),
-        "amount_due":          (getattr(invoice, "amount_due", 0) or 0) / 100,
+        "amount_due":          amount_due,
+        "amount_paid":         (getattr(invoice, "amount_paid", 0) or 0) / 100,
         "currency":            getattr(invoice, "currency", "usd"),
         "status":              "paid" if getattr(invoice, "status", None) == "paid" else "due",
         "invoice_pdf":         getattr(invoice, "invoice_pdf", None),
         "hosted_invoice_url":  getattr(invoice, "hosted_invoice_url", None),
         "tier":                _tier_from_invoice(invoice),
+        "billing_reason":      billing_reason,
+        "period_start":        getattr(invoice, "period_start", None),
+        "period_end":          getattr(invoice, "period_end", None),
+        "is_trial":            is_trial,
     }
 
 

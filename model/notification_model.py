@@ -22,6 +22,7 @@ NotificationType = Literal[
     "subscription_ending",
     "subscription_canceled",
     "payment_failed",
+    "trial_ending",
 ]
 
 

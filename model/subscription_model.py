@@ -218,6 +218,7 @@ class SubscriptionResponse(BaseModel):
     current_period_end:     Optional[datetime]
     trial_end:              Optional[datetime]
     is_active:              bool
+    is_in_trial:            bool = False
     conversation_limit:     Optional[int] = None
     conversations_used:     int = 0
     free_trial_used:        bool = False

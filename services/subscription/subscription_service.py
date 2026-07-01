@@ -32,6 +32,14 @@ PRICE_MAP: dict[str, str] = {
     "advanced:annual":       "price_1SRPh0FS3P7wS29bfAjG9QGZ",
 }
 
+# New brand-new subscriptions to these tiers get a free trial before the
+# first real charge — Stripe bills the saved card automatically once it
+# ends, no separate "free" plan needed. Existing subscribers switching
+# plans (change_subscription_plan) never get a trial — full price applies
+# immediately, same as today.
+TRIAL_DAYS = 14
+TRIAL_ELIGIBLE_TIERS: set[str] = {"professional", "advanced"}
+
 PLAN_TRAIN_LIMITS: dict[str, int] = {
     "free":         5,
     "professional": 20,
@@ -217,6 +225,15 @@ async def create_subscription_intent(
     requires_payment=False as already-complete and just wait for the
     webhook to sync MongoDB.
 
+    professional/advanced get TRIAL_DAYS free before the first real charge
+    (trial_settings cancels the subscription if no card is on file by the
+    time the trial ends, so it never silently lapses into unpaid access).
+    A trial invoice totals $0, so Stripe doesn't return a PaymentIntent for
+    it — instead it creates a pending SetupIntent to collect and save the
+    card for when billing actually starts. The caller gets that back as
+    intent_kind="setup" instead of "payment" so the frontend can call the
+    matching Stripe.js confirm method.
+
     Existing subscribers switching plans should use
     change_subscription_plan instead, which reuses their saved card.
     """
@@ -246,14 +263,21 @@ async def create_subscription_intent(
                 company_id, customer_id,
             )
 
-        subscription = stripe.Subscription.create(
-            customer=customer_id,
-            items=[{"price": price_id}],
-            payment_behavior="default_incomplete",
-            payment_settings={"save_default_payment_method": "on_subscription"},
-            expand=["latest_invoice.confirmation_secret"],
-            metadata={"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
-        )
+        subscription_kwargs: dict[str, Any] = {
+            "customer":         customer_id,
+            "items":            [{"price": price_id}],
+            "payment_behavior": "default_incomplete",
+            "payment_settings": {"save_default_payment_method": "on_subscription"},
+            "expand":           ["latest_invoice.confirmation_secret", "pending_setup_intent"],
+            "metadata":         {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
+        }
+        if tier in TRIAL_ELIGIBLE_TIERS:
+            subscription_kwargs["trial_period_days"] = TRIAL_DAYS
+            subscription_kwargs["trial_settings"] = {
+                "end_behavior": {"missing_payment_method": "cancel"},
+            }
+
+        subscription = stripe.Subscription.create(**subscription_kwargs)
 
         # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
         # from Invoice objects (to support partial payments) — the
@@ -262,15 +286,24 @@ async def create_subscription_intent(
         latest_invoice = subscription.latest_invoice
         confirmation_secret = getattr(latest_invoice, "confirmation_secret", None) if latest_invoice else None
         client_secret = getattr(confirmation_secret, "client_secret", None) if confirmation_secret else None
+        intent_kind = "payment"
+
+        if not client_secret:
+            pending_setup_intent = getattr(subscription, "pending_setup_intent", None)
+            setup_secret = getattr(pending_setup_intent, "client_secret", None) if pending_setup_intent else None
+            if setup_secret:
+                client_secret = setup_secret
+                intent_kind = "setup"
 
         logger.info(
-            "subscription.create_intent.ok company_id=%s tier=%s sub_id=%s requires_payment=%s",
-            company_id, tier, subscription.id, bool(client_secret),
+            "subscription.create_intent.ok company_id=%s tier=%s sub_id=%s requires_payment=%s intent_kind=%s",
+            company_id, tier, subscription.id, bool(client_secret), intent_kind,
         )
         return {
             "subscription_id":  subscription.id,
             "client_secret":    client_secret,
             "requires_payment": bool(client_secret),
+            "intent_kind":      intent_kind,
         }
     except stripe.StripeError as e:
         logger.error("subscription.create_intent.stripe_error company_id=%s error=%s", company_id, e)
@@ -313,6 +346,14 @@ async def create_checkout_session(
         "metadata":          {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
         "subscription_data": {"metadata": {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle}},
     }
+    if tier in TRIAL_ELIGIBLE_TIERS:
+        session_kwargs["subscription_data"]["trial_period_days"] = TRIAL_DAYS
+        session_kwargs["subscription_data"]["trial_settings"] = {
+            "end_behavior": {"missing_payment_method": "cancel"},
+        }
+        # Checkout (unlike Elements) needs this explicitly or it won't
+        # collect a card at all during a $0-due trial signup.
+        session_kwargs["payment_method_collection"] = "always"
     if customer_id:
         session_kwargs["customer"] = customer_id
     else:
@@ -507,6 +548,8 @@ async def handle_webhook_event(db: AsyncIOMotorDatabase, event: Any) -> None:
         await _on_subscription_upsert(db, data)
     elif etype == "customer.subscription.deleted":
         await _on_subscription_deleted(db, data)
+    elif etype == "customer.subscription.trial_will_end":
+        await _on_trial_will_end(db, data)
     elif etype == "invoice.payment_succeeded":
         await _on_payment_succeeded(db, data)
     elif etype == "invoice.payment_failed":
@@ -728,6 +771,26 @@ async def _on_payment_succeeded(db: AsyncIOMotorDatabase, invoice: Any) -> None:
     tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "active", tier, period_end, period_start)
     logger.info("payment.succeeded.done company_id=%s period_end=%s", company_id, period_end)
+
+
+async def _on_trial_will_end(db: AsyncIOMotorDatabase, sub: Any) -> None:
+    """Stripe fires this 3 days before a trial ends. Send a reminder notification."""
+    sub_id   = getattr(sub, "id", "?")
+    metadata = _read_metadata(sub)
+    logger.info("trial_will_end sub_id=%s metadata=%s", sub_id, metadata)
+
+    company_id = metadata.get("company_id")
+    if not company_id:
+        existing = await db["subscriptions"].find_one({"stripe_subscription_id": sub_id})
+        if existing:
+            company_id = existing["company_id"]
+    if not company_id:
+        logger.warning("trial_will_end.no_company_id sub_id=%s", sub_id)
+        return
+
+    trial_end = _stripe_ts(getattr(sub, "trial_end", None))
+    await notification_service.create_trial_ending_notification(db, company_id, trial_end)
+    logger.info("trial_will_end.done company_id=%s trial_end=%s", company_id, trial_end)
 
 
 async def _on_payment_failed(db: AsyncIOMotorDatabase, invoice: Any) -> None:

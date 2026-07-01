@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable, Optional
+
+# Called as on_progress(percent, stage, message, found) at each stage
+# boundary — `found` is an optional list of {category, label, source_url}
+# dicts for newly-discovered facts. Purely an observer hook for live
+# progress reporting; does not affect the pipeline's actual output.
+OnProgress = Callable[[int, str, str, Optional[list[dict]]], Awaitable[None]]
 
 from services.chatbot.llm import llm
 from config import settings
@@ -116,6 +122,7 @@ async def train_company(
     website_url: str,
     company_name: str,
     company_type: str,
+    on_progress: Optional[OnProgress] = None,
 ) -> dict[str, Any]:
     """
     Full LLM-powered knowledge base training pipeline.
@@ -129,6 +136,10 @@ async def train_company(
 
     Returns metadata dict — the caller (knowledge_router) saves this to MongoDB.
 
+    `on_progress`, if given, is called at each stage boundary for live
+    progress reporting (see OnProgress above). Purely observational — it
+    never changes what any stage computes.
+
     Return shape:
     {
         "entries_stored":  int,      # LLM-approved facts stored in Pinecone
@@ -141,10 +152,15 @@ async def train_company(
         "categories":      list[str] # knowledge categories found
     }
     """
+    async def _report(percent: int, stage: str, message: str, found: Optional[list[dict]] = None) -> None:
+        if on_progress:
+            await on_progress(percent, stage, message, found)
+
     logger.info(
         "knowledgebase.train.start company_id=%s website=%s",
         company_id, website_url,
     )
+    await _report(2, "starting", "Starting training…")
 
     # ── Step 1: Crawl website ─────────────────────────────────────────────────
     logger.info("knowledgebase.step=1 crawling website=%s", website_url)
@@ -161,6 +177,7 @@ async def train_company(
             "continuing_with_web_search=true",
             company_id, website_url,
         )
+    await _report(20, "crawl", f"Crawled {len(crawled_pages)} page(s) from your website")
 
     # ── Step 2: Enrich with web search ────────────────────────────────────────
     logger.info("knowledgebase.step=2 web_search company=%s", company_name)
@@ -174,6 +191,8 @@ async def train_company(
     except Exception as e:
         logger.exception("knowledgebase.step=2 failed during enrich_with_web_search: %s", e)
         search_results = []
+
+    await _report(35, "search", f"Found {len(search_results)} supporting result(s) from web search")
 
     if not crawled_pages and not search_results:
         return {
@@ -193,6 +212,30 @@ async def train_company(
         "knowledgebase.step=3 llm_extraction pages=%d search_snippets=%d",
         len(crawled_pages), len(search_results),
     )
+
+    # Reports per-batch as extraction progresses — each batch covers a
+    # handful of crawled pages (or the web-search snippets), so this is
+    # what powers the live "found X on this page" feed during the slowest
+    # stage of the pipeline. Capped below 75 — the final jump to 75% is
+    # reported once extraction is fully done, below.
+    _extract_percent = {"value": 35}
+
+    async def _on_batch_done(label: str, entries: list[dict]) -> None:
+        _extract_percent["value"] = min(74, _extract_percent["value"] + 5)
+        found = [
+            {
+                "category":   e.get("category", "overview"),
+                "label":      e.get("topic", ""),
+                "source_url": label,
+            }
+            for e in entries
+        ]
+        message = (
+            f"Found {len(entries)} fact(s) on {label}"
+            if entries else f"Checked {label} — nothing new found"
+        )
+        await _report(_extract_percent["value"], "extract", message, found=found or None)
+
     try:
         knowledge_entries = await extract_knowledge(
             llm=llm,
@@ -200,11 +243,14 @@ async def train_company(
             company_type=company_type,
             crawled_pages=crawled_pages,
             search_results=search_results,
+            on_batch_done=_on_batch_done if on_progress else None,
         )
         logger.info("knowledgebase.step=3 completed. extracted %d entries.", len(knowledge_entries))
     except Exception as e:
         logger.exception("knowledgebase.step=3 failed during extract_knowledge: %s", e)
         knowledge_entries = []
+
+    await _report(75, "extract", f"Extracted {len(knowledge_entries)} fact(s) total")
 
     if not knowledge_entries:
         return {
@@ -243,6 +289,8 @@ async def train_company(
     else:
         logger.info("knowledgebase.step=4 skipped because knowledge_entries is empty.")
 
+    await _report(90, "store", f"Stored {entries_stored} fact(s) in your knowledge base")
+
     # ── Step 5: Quality score ─────────────────────────────────────────────────
     categories = list({e.get("category", "") for e in knowledge_entries if e.get("category")})
 
@@ -253,6 +301,8 @@ async def train_company(
         pages_crawled=len(crawled_pages),
         missing_info=missing_info,
     )
+
+    await _report(95, "score", f"Quality score: {quality_score:.0f}/100")
 
     result = {
         "entries_stored":  entries_stored,

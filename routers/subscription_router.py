@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 
 import stripe
+from datetime import datetime
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
@@ -124,7 +126,7 @@ async def create_subscription(
         billing_cycle=payload.billing_cycle,
     )
     _raise_service_error(result)
-    return result   # {"subscription_id", "client_secret", "requires_payment"}
+    return result   # {"subscription_id", "client_secret", "requires_payment", "intent_kind"}
 
 
 # ── POST /subscription/change-plan/{company_id} ──────────────────────────────
@@ -205,19 +207,30 @@ async def get_status(
             "No subscription found for this company.",
         )
     # Build safe response (strip Stripe IDs)
-    is_active = doc.get("subscription_status") in ("active", "trialing")
+    status_val = doc.get("subscription_status", "active")
+    trial_end  = doc.get("trial_end")
+    # PyMongo returns timezone-naive UTC datetimes; use utcnow() so the
+    # comparison against trial_end doesn't raise a TypeError.
+    now        = datetime.utcnow()
+    is_active  = status_val in ("active", "trialing")
+    is_in_trial = (
+        status_val == "trialing"
+        and trial_end is not None
+        and trial_end > now
+    )
     return SubscriptionResponse(
         company_id=doc["company_id"],
         subscription_tier=doc.get("subscription_tier", "professional"),
-        subscription_status=doc.get("subscription_status", "active"),
+        subscription_status=status_val,
         billing_cycle=doc.get("billing_cycle", "monthly"),
         payment_amount=doc.get("payment_amount", 0.0),
         currency=doc.get("currency", "usd"),
         cancel_at_period_end=doc.get("cancel_at_period_end", False),
         current_period_start=doc.get("current_period_start"),
         current_period_end=doc.get("current_period_end"),
-        trial_end=doc.get("trial_end"),
+        trial_end=trial_end,
         is_active=is_active,
+        is_in_trial=is_in_trial,
         conversation_limit=doc.get("conversation_limit"),
         conversations_used=doc.get("conversations_used", 0),
         free_trial_used=doc.get("free_trial_used", False),

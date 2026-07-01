@@ -10,6 +10,7 @@ Endpoints for training a company's AI knowledge base.
 from __future__ import annotations
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, status, Depends
@@ -80,6 +81,16 @@ class TrainStatusResponse(BaseModel):
     namespace: str | None
 
 
+class TrainProgressResponse(BaseModel):
+    status: str                   # "idle" | "running" | "done" | "error"
+    percent: int = 0
+    stage: str | None = None
+    message: str | None = None
+    found: list[dict] = Field(default_factory=list)
+    started_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _get_company(db: AsyncIOMotorDatabase, company_id: str) -> dict:
@@ -89,6 +100,19 @@ async def _get_company(db: AsyncIOMotorDatabase, company_id: str) -> dict:
     if not company:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Company not found.")
     return company
+
+
+# Separate, ephemeral collection just for live progress UI — never read by
+# the training pipeline itself, so it can't affect training behavior.
+_PROGRESS_COLLECTION = "training_progress"
+
+
+async def _set_progress(db: AsyncIOMotorDatabase, company_id: str, **fields: Any) -> None:
+    await db[_PROGRESS_COLLECTION].update_one(
+        {"company_id": company_id},
+        {"$set": {**fields, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
 
 
 # ── POST /knowledge/train/{company_id} ───────────────────────────────────────
@@ -126,6 +150,24 @@ async def train(
         company_id, payload.website_url,
     )
 
+    # ── Live progress (purely additive — polled separately via GET /progress) ──
+    found_items: list[dict] = []
+    await _set_progress(
+        db, company_id,
+        status="running", percent=0, stage="starting",
+        message="Starting training…", found=[],
+        started_at=datetime.now(timezone.utc),
+    )
+
+    async def _on_progress(percent: int, stage: str, message: str, found: list[dict] | None) -> None:
+        if found:
+            found_items.extend(found)
+        await _set_progress(
+            db, company_id,
+            status="running", percent=percent, stage=stage,
+            message=message, found=found_items[-30:],
+        )
+
     # Run the training pipeline
     logger.info("Starting pipeline for company_id=%s, URL=%s", company_id, payload.website_url)
     try:
@@ -134,9 +176,11 @@ async def train(
             website_url=payload.website_url,
             company_name=payload.company_name,
             company_type=payload.company_type,
+            on_progress=_on_progress,
         )
     except Exception as e:
         logger.exception("Pipeline failed unexpectedly for company_id=%s: %s", company_id, e)
+        await _set_progress(db, company_id, status="error", message=str(e))
         raise HTTPException(
             status.HTTP_500_INTERNAL_SERVER_ERROR,
             f"Training failed with an internal error: {e}"
@@ -144,6 +188,7 @@ async def train(
 
     if "error" in raw_result and raw_result["error"]:
         logger.error("Pipeline returned logic error for company_id=%s: %s", company_id, raw_result["error"])
+        await _set_progress(db, company_id, status="error", message=raw_result["error"])
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, raw_result["error"])
 
     # Validate the result through the Pydantic model — catches missing/bad fields early
@@ -151,6 +196,7 @@ async def train(
         result = TrainResultModel(**raw_result)
     except Exception as e:
         logger.exception("TrainResult validation failed for company_id=%s: %s", company_id, e)
+        await _set_progress(db, company_id, status="error", message=f"Training result invalid: {e}")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, f"Training result invalid: {e}")
 
     # Build history entry (shared by both collections)
@@ -248,6 +294,13 @@ async def train(
         company_id,
     )
 
+    await _set_progress(
+        db, company_id,
+        status="done", percent=100, stage="done",
+        message="Training complete — knowledge base is ready.",
+        found=found_items[-30:],
+    )
+
     return TrainResponse(
         message="Training complete — knowledge base is ready.",
         company_id=company_id,
@@ -261,6 +314,29 @@ async def train(
         last_updated=result.last_updated,
         missing_info=result.missing_info,
     )
+
+
+# ── GET /knowledge/progress/{company_id} ─────────────────────────────────────
+# Live progress written by train() above while it runs. Meant to be polled
+# every 1-2s by the frontend WHILE the POST /train request is in flight on
+# a separate connection — train() itself is unchanged and still returns the
+# full TrainResponse synchronously when done.
+
+@router.get(
+    "/progress/{company_id}",
+    response_model=TrainProgressResponse,
+    summary="Get live training progress (poll while a POST /train call is running)",
+)
+async def get_progress(
+    company_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    if not ObjectId.is_valid(company_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid company ID.")
+    doc = await db[_PROGRESS_COLLECTION].find_one({"company_id": company_id}, {"_id": 0})
+    if not doc:
+        return TrainProgressResponse(status="idle", percent=0)
+    return TrainProgressResponse(**doc)
 
 
 # ── GET /knowledge/status/{company_id} ───────────────────────────────────────

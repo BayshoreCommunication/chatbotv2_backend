@@ -120,6 +120,20 @@ async def create_payment_failed_notification(
     )
 
 
+async def create_trial_ending_notification(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    trial_end: Optional[datetime],
+) -> None:
+    """Insert a notification 3 days before the free trial ends (Stripe trial_will_end event)."""
+    when = trial_end.strftime("%B %d, %Y") if trial_end else "soon"
+    await _insert(
+        db, company_id, "trial_ending",
+        title="Free trial ending in 3 days",
+        message=f"Your 14-day free trial ends on {when}. Your saved card will be charged automatically — cancel anytime before then to avoid a charge.",
+    )
+
+
 async def get_notifications(
     db: AsyncIOMotorDatabase, company_id: str, limit: int = 20,
 ) -> List[dict]:

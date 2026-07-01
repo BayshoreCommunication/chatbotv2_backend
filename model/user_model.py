@@ -5,7 +5,7 @@ from pydantic import BaseModel, EmailStr, Field
 
 # ── Type Aliases ─────────────────────────────────────────────────────────────
 
-SubscriptionType = Literal["free", "starter", "professional", "enterprise"]
+SubscriptionType = Literal["free", "professional", "advanced", "enterprise"]
 
 CompanyType = Literal[
     "tech-company",
