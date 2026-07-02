@@ -417,7 +417,9 @@ async def change_subscription_plan(
 
     existing = await db["subscriptions"].find_one({"company_id": company_id})
     if not existing or not existing.get("stripe_subscription_id"):
-        return {"error": "no_subscription", "detail": "No active subscription found."}
+        # No Stripe subscription yet — create a fresh one instead of erroring
+        logger.info("subscription.change_plan.no_existing_sub company_id=%s tier=%s, creating new", company_id, tier)
+        return await create_subscription_intent(db, company_id, tier, billing_cycle)
 
     sub_id = existing["stripe_subscription_id"]
     try:

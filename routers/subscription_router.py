@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 
 import stripe
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -201,26 +201,46 @@ async def get_status(
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
     doc = await get_subscription(db, company_id)
+    # Use naive UTC for comparisons — MongoDB returns timezone-naive datetimes
+    now = datetime.utcnow()
+    now_aware = datetime.now(timezone.utc)
+
     if not doc:
-        raise HTTPException(
-            status.HTTP_404_NOT_FOUND,
-            "No subscription found for this company.",
+        # No subscription record yet — return a default free-tier response
+        # so the frontend always gets a valid object instead of a 404.
+        return SubscriptionResponse(
+            company_id=company_id,
+            subscription_tier="free",
+            subscription_status="active",
+            billing_cycle="monthly",
+            payment_amount=0.0,
+            currency="usd",
+            cancel_at_period_end=False,
+            current_period_start=None,
+            current_period_end=None,
+            trial_end=None,
+            is_active=True,
+            is_in_trial=False,
+            conversation_limit=1000,
+            conversations_used=0,
+            free_trial_used=False,
+            created_at=now_aware,
+            updated_at=now_aware,
         )
-    # Build safe response (strip Stripe IDs)
+
     status_val = doc.get("subscription_status", "active")
     trial_end  = doc.get("trial_end")
-    # PyMongo returns timezone-naive UTC datetimes; use utcnow() so the
-    # comparison against trial_end doesn't raise a TypeError.
-    now        = datetime.utcnow()
     is_active  = status_val in ("active", "trialing")
+    # MongoDB stores naive UTC datetimes; strip tzinfo before comparing
+    trial_end_naive = trial_end.replace(tzinfo=None) if trial_end and trial_end.tzinfo else trial_end
     is_in_trial = (
         status_val == "trialing"
-        and trial_end is not None
-        and trial_end > now
+        and trial_end_naive is not None
+        and trial_end_naive > now
     )
     return SubscriptionResponse(
         company_id=doc["company_id"],
-        subscription_tier=doc.get("subscription_tier", "professional"),
+        subscription_tier=doc.get("subscription_tier", "free"),
         subscription_status=status_val,
         billing_cycle=doc.get("billing_cycle", "monthly"),
         payment_amount=doc.get("payment_amount", 0.0),
@@ -231,11 +251,11 @@ async def get_status(
         trial_end=trial_end,
         is_active=is_active,
         is_in_trial=is_in_trial,
-        conversation_limit=doc.get("conversation_limit"),
+        conversation_limit=doc.get("conversation_limit", 1000),
         conversations_used=doc.get("conversations_used", 0),
         free_trial_used=doc.get("free_trial_used", False),
-        created_at=doc["created_at"],
-        updated_at=doc["updated_at"],
+        created_at=doc.get("created_at", now),
+        updated_at=doc.get("updated_at", now),
     )
 
 
