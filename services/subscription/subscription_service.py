@@ -425,36 +425,40 @@ async def change_subscription_plan(
     try:
         sub = stripe.Subscription.retrieve(sub_id)
 
-        if sub.status in ("incomplete", "incomplete_expired"):
-            # The existing subscription was never actually paid for (the
-            # customer abandoned the initial payment) — Stripe blocks any
-            # item/price change on an "incomplete" subscription with "Only
-            # minor attributes ... can be updated". Nothing to switch FROM
-            # since it was never active, so cancel the stuck one and start
-            # fresh with the new plan instead.
+        if sub.status in ("incomplete", "incomplete_expired", "canceled"):
+            # Can't modify these — start fresh with a new subscription instead.
             logger.warning(
-                "subscription.change_plan.incomplete_sub_replacing company_id=%s old_sub_id=%s",
-                company_id, sub_id,
+                "subscription.change_plan.non_modifiable_sub_replacing company_id=%s old_sub_id=%s status=%s",
+                company_id, sub_id, sub.status,
             )
-            try:
-                stripe.Subscription.cancel(sub_id)
-            except stripe.StripeError as cancel_err:
-                logger.warning(
-                    "subscription.change_plan.cancel_incomplete_failed sub_id=%s error=%s",
-                    sub_id, cancel_err,
-                )
+            if sub.status != "canceled":
+                try:
+                    stripe.Subscription.cancel(sub_id)
+                except stripe.StripeError as cancel_err:
+                    logger.warning(
+                        "subscription.change_plan.cancel_failed sub_id=%s error=%s",
+                        sub_id, cancel_err,
+                    )
             return await create_subscription_intent(db, company_id, tier, billing_cycle)
 
         item_id = sub["items"]["data"][0]["id"]
-        updated = stripe.Subscription.modify(
-            sub_id,
-            items=[{"id": item_id, "price": price_id}],
-            proration_behavior="none",
-            billing_cycle_anchor="now",
-            payment_behavior="default_incomplete",
-            expand=["latest_invoice.confirmation_secret"],
-            metadata={"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
-        )
+
+        # When the sub is still in trial, billing_cycle_anchor="now" is rejected
+        # by Stripe because the anchor can't precede the trial end date.
+        # End the trial immediately so the new plan takes effect right away.
+        modify_kwargs: dict = {
+            "items": [{"id": item_id, "price": price_id}],
+            "proration_behavior": "none",
+            "payment_behavior": "default_incomplete",
+            "expand": ["latest_invoice.confirmation_secret"],
+            "metadata": {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
+        }
+        if sub.status == "trialing":
+            modify_kwargs["trial_end"] = "now"
+        else:
+            modify_kwargs["billing_cycle_anchor"] = "now"
+
+        updated = stripe.Subscription.modify(sub_id, **modify_kwargs)
 
         # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
         # from Invoice objects — `confirmation_secret` is the replacement and
