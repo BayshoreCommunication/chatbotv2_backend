@@ -247,8 +247,52 @@ async def create_subscription_intent(
         logger.error("subscription.create_intent.invalid_plan key=%s", price_key)
         return {"error": "invalid_plan", "detail": f"Unknown plan: {price_key}"}
 
-    existing    = await db["subscriptions"].find_one({"company_id": company_id}, {"stripe_customer_id": 1})
-    customer_id = (existing or {}).get("stripe_customer_id")
+    existing        = await db["subscriptions"].find_one({"company_id": company_id})
+    customer_id     = (existing or {}).get("stripe_customer_id")
+    existing_sub_id = (existing or {}).get("stripe_subscription_id")
+
+    # Before creating a new Stripe subscription, check whether there is already
+    # an incomplete or trialing subscription for the same plan. Reusing it means
+    # the checkout page can be refreshed without firing a new set of webhook
+    # events each time.
+    if existing_sub_id:
+        try:
+            prev = stripe.Subscription.retrieve(
+                existing_sub_id,
+                expand=["latest_invoice.confirmation_secret", "pending_setup_intent"],
+            )
+            if prev.status in ("incomplete", "trialing"):
+                prev_meta   = _read_metadata(prev)
+                same_plan   = (
+                    prev_meta.get("tier") == tier
+                    and prev_meta.get("billing_cycle") == billing_cycle
+                )
+                if same_plan:
+                    li     = prev.latest_invoice
+                    cs_obj = getattr(li, "confirmation_secret", None) if li else None
+                    cs     = getattr(cs_obj, "client_secret", None) if cs_obj else None
+                    kind   = "payment"
+                    if not cs:
+                        psi  = getattr(prev, "pending_setup_intent", None)
+                        pcs  = getattr(psi, "client_secret", None) if psi else None
+                        if pcs:
+                            cs, kind = pcs, "setup"
+                    if cs:
+                        logger.info(
+                            "subscription.create_intent.reuse company_id=%s sub_id=%s intent_kind=%s",
+                            company_id, existing_sub_id, kind,
+                        )
+                        return {
+                            "subscription_id":  prev.id,
+                            "client_secret":    cs,
+                            "requires_payment": True,
+                            "intent_kind":      kind,
+                        }
+        except stripe.StripeError as reuse_err:
+            logger.warning(
+                "subscription.create_intent.reuse_check_failed sub_id=%s error=%s — creating fresh",
+                existing_sub_id, reuse_err,
+            )
 
     try:
         if not customer_id:
@@ -267,11 +311,19 @@ async def create_subscription_intent(
             "customer":         customer_id,
             "items":            [{"price": price_id}],
             "payment_behavior": "default_incomplete",
-            "payment_settings": {"save_default_payment_method": "on_subscription"},
+            "payment_settings": {
+                "save_default_payment_method": "on_subscription",
+                # Must match the payment_method_types restriction set on the
+                # Stripe Elements form — omitting this causes a mismatch error
+                # ("automatic payment methods … cannot be confirmed through the
+                # API configured with payment_method_types").
+                "payment_method_types": ["card"],
+            },
             "expand":           ["latest_invoice.confirmation_secret", "pending_setup_intent"],
             "metadata":         {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
         }
-        if tier in TRIAL_ELIGIBLE_TIERS:
+        trial_already_used = bool((existing or {}).get("free_trial_used", False))
+        if tier in TRIAL_ELIGIBLE_TIERS and not trial_already_used:
             subscription_kwargs["trial_period_days"] = TRIAL_DAYS
             subscription_kwargs["trial_settings"] = {
                 "end_behavior": {"missing_payment_method": "cancel"},
@@ -693,8 +745,17 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
     )
     logger.info("subscription.upsert.db_write matched=%s upserted_id=%s", result.matched_count, result.upserted_id)
 
+    sub_status = getattr(sub, "status", "active")
+    # A trialing subscription keeps a pending_setup_intent until the customer
+    # confirms their card. Don't grant access until then — treat it as
+    # incomplete so is_subscribed stays False. customer.subscription.updated
+    # fires once setup completes (pending_setup_intent clears), re-running
+    # this handler and granting access at the right moment.
+    pending_si      = getattr(sub, "pending_setup_intent", None)
+    effective_status = "incomplete" if (sub_status == "trialing" and pending_si) else sub_status
+
     await _sync_users_doc(
-        db, company_id, getattr(sub, "status", "active"), tier,
+        db, company_id, effective_status, tier,
         doc["current_period_end"], doc["current_period_start"],
     )
 

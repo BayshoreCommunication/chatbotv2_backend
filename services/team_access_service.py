@@ -50,12 +50,20 @@ async def add_team_member(
     if active_count >= MAX_MEMBERS:
         return {"error": "limit_reached", "detail": f"Maximum of {MAX_MEMBERS} team members reached."}
 
-    # No duplicate active/pending invite to same email
+    # Block adding an email that belongs to a registered main user
+    main_user = await db["users"].find_one({"email": email}, {"_id": 1})
+    if main_user:
+        return {"error": "is_registered_user", "detail": "This email belongs to a registered account and cannot be added as a team member."}
+
+    # No duplicate active/pending invite to same email under this owner
     existing = await db["team_access"].find_one(
         {"owner_id": owner_id, "email": email, "status": {"$nin": ["revoked"]}}
     )
     if existing:
-        return {"error": "already_exists", "detail": "This email already has pending or active access."}
+        status = existing.get("status", "pending")
+        if status == "active":
+            return {"error": "already_active", "detail": "This member already has active access."}
+        return {"error": "already_exists", "detail": "A pending invite already exists for this email."}
 
     token = secrets.token_urlsafe(32)
     now   = _now()
