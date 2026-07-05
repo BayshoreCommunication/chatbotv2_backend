@@ -62,6 +62,12 @@ class TokenResponse(BaseModel):
     user_id: str
     company_name: str
     role: str
+    has_paid_subscription: bool = False
+    subscription_type: str = "free"
+    # Populated only for team-member sessions; null for regular owner sessions
+    is_team_member: bool = False
+    team_member_email: Optional[str] = None
+    team_member_name: Optional[str] = None
 
 
 # ── User CRUD Schemas ─────────────────────────────────────────────────────────

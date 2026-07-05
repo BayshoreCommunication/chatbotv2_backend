@@ -140,11 +140,46 @@ async def verify_otp(db: AsyncIOMotorDatabase, payload: OTPVerifyRequest) -> dic
 # ── Step 3: Signin — email + password → JWT ───────────────────────────────────
 
 async def signin(db: AsyncIOMotorDatabase, payload: SigninRequest) -> dict:
-    """Authenticate with email + password. Returns a JWT bearer token."""
+    """Authenticate with email + password. Returns a JWT bearer token.
+    Falls back to team_access for members who have no user account."""
 
     user = await db["users"].find_one({"email": payload.email})
 
-    if not user or not verify_password(payload.password, user["hashed_password"]):
+    if not user:
+        # Check team_access — active members skip the password requirement
+        # because they already verified their email via the invite link.
+        from services.team_access_service import signin_team_member
+        team_result = await signin_team_member(db, payload.email)
+        if team_result.get("error"):
+            err = team_result["error"]
+            # Surface specific team errors; fall back to generic for unknown email
+            if err in ("team_member_not_verified", "account_disabled", "owner_not_found"):
+                return {"error": err}
+            return {"error": "invalid_credentials"}
+
+        owner = team_result["owner"]
+        token = create_access_token({
+            "sub":            str(owner["_id"]),
+            "email":          owner["email"],
+            "role":           owner["role"],
+            "team_member":    True,
+            "team_email":     team_result["member_email"],
+            "team_access_id": team_result["team_access_id"],
+        })
+        return {
+            "access_token":          token,
+            "token_type":            "bearer",
+            "user_id":               str(owner["_id"]),
+            "company_name":          owner["company_name"],
+            "role":                  owner["role"],
+            "has_paid_subscription": bool(owner.get("has_paid_subscription", False)),
+            "subscription_type":     owner.get("subscription_type", "free"),
+            "is_team_member":        True,
+            "team_member_email":     team_result["member_email"],
+            "team_member_name":      team_result["member_name"],
+        }
+
+    if not verify_password(payload.password, user["hashed_password"]):
         return {"error": "invalid_credentials"}
 
     if not user.get("is_verified"):
@@ -173,10 +208,18 @@ async def signin(db: AsyncIOMotorDatabase, payload: SigninRequest) -> dict:
 # ── Passwordless sign-in: request OTP ─────────────────────────────────────────
 
 async def request_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPRequest) -> dict:
-    """Email a 6-digit sign-in code to an existing, verified, active account."""
+    """Email a 6-digit sign-in code to an existing, verified, active account.
+    Falls back to team_access collection if email is not a registered user."""
 
     user = await db["users"].find_one({"email": payload.email})
     if not user:
+        # Check if this email belongs to an active team member
+        from services.team_access_service import request_team_otp
+        team_result = await request_team_otp(db, payload.email)
+        if team_result.get("ok"):
+            return {"message": f"A sign-in code has been sent to {payload.email}."}
+        if team_result.get("error") == "email_send_failed":
+            return {"error": "email_send_failed"}
         return {"error": "account_not_found"}
     if not user.get("is_verified"):
         return {"error": "email_not_verified"}
@@ -207,11 +250,41 @@ async def request_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPRequest) 
 # ── Passwordless sign-in: verify OTP → JWT ────────────────────────────────────
 
 async def verify_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPVerifyRequest) -> dict:
-    """Validate the sign-in code and return a JWT bearer token, same shape as signin()."""
+    """Validate the sign-in code and return a JWT bearer token, same shape as signin().
+    Falls back to team_access collection — team members get the owner's session."""
 
     user = await db["users"].find_one({"email": payload.email})
     if not user:
-        return {"error": "account_not_found"}
+        # Try team member OTP verification
+        from services.team_access_service import verify_team_otp
+        team_result = await verify_team_otp(db, payload.email, payload.otp_code)
+        if team_result.get("error"):
+            err = team_result["error"]
+            if err == "not_team_member":
+                return {"error": "account_not_found"}
+            return {"error": err}
+
+        owner = team_result["owner"]
+        token = create_access_token({
+            "sub":            str(owner["_id"]),
+            "email":          owner["email"],
+            "role":           owner["role"],
+            "team_member":    True,
+            "team_email":     team_result["member_email"],
+            "team_access_id": team_result["team_access_id"],
+        })
+        return {
+            "access_token":          token,
+            "token_type":            "bearer",
+            "user_id":               str(owner["_id"]),
+            "company_name":          owner["company_name"],
+            "role":                  owner["role"],
+            "has_paid_subscription": bool(owner.get("has_paid_subscription", False)),
+            "subscription_type":     owner.get("subscription_type", "free"),
+            "is_team_member":        True,
+            "team_member_email":     team_result["member_email"],
+            "team_member_name":      team_result["member_name"],
+        }
 
     if not user.get("otp_code"):
         return {"error": "otp_not_requested"}

@@ -15,16 +15,19 @@ from services import auth_service
 router = APIRouter(prefix="/auth", tags=["Auth"])
 
 ERROR_MAP = {
-    "email_taken":         (status.HTTP_409_CONFLICT,       "Email is already registered."),
-    "email_send_failed":   (status.HTTP_502_BAD_GATEWAY,    "Failed to send OTP email. Try again."),
-    "otp_not_found":       (status.HTTP_404_NOT_FOUND,      "No pending signup found for this email."),
-    "invalid_otp":         (status.HTTP_400_BAD_REQUEST,    "Invalid OTP code."),
-    "otp_expired":         (status.HTTP_400_BAD_REQUEST,    "OTP has expired. Please sign up again."),
-    "invalid_credentials": (status.HTTP_401_UNAUTHORIZED,   "Invalid email or password."),
-    "email_not_verified":  (status.HTTP_403_FORBIDDEN,      "Please verify your email before signing in."),
-    "account_disabled":    (status.HTTP_403_FORBIDDEN,      "Your account has been disabled."),
-    "account_not_found":   (status.HTTP_404_NOT_FOUND,      "No account found with this email."),
-    "otp_not_requested":   (status.HTTP_400_BAD_REQUEST,    "Request a sign-in code first."),
+    "email_taken":               (status.HTTP_409_CONFLICT,       "Email is already registered."),
+    "email_send_failed":         (status.HTTP_502_BAD_GATEWAY,    "Failed to send OTP email. Try again."),
+    "otp_not_found":             (status.HTTP_404_NOT_FOUND,      "No pending signup found for this email."),
+    "invalid_otp":               (status.HTTP_400_BAD_REQUEST,    "Invalid OTP code."),
+    "otp_expired":               (status.HTTP_400_BAD_REQUEST,    "OTP has expired. Please sign up again."),
+    "invalid_credentials":       (status.HTTP_401_UNAUTHORIZED,   "Invalid email or password."),
+    "email_not_verified":        (status.HTTP_403_FORBIDDEN,      "Please verify your email before signing in."),
+    "account_disabled":          (status.HTTP_403_FORBIDDEN,      "Your account has been disabled."),
+    "account_not_found":         (status.HTTP_404_NOT_FOUND,      "No account found with this email."),
+    "otp_not_requested":         (status.HTTP_400_BAD_REQUEST,    "Request a sign-in code first."),
+    # Team-access specific
+    "team_member_not_verified":  (status.HTTP_403_FORBIDDEN,      "Please verify your team access email first."),
+    "owner_not_found":           (status.HTTP_404_NOT_FOUND,      "The account owner could not be found."),
 }
 
 
