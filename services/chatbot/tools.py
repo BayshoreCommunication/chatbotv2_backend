@@ -252,6 +252,26 @@ def _preferred_time_to_utc_fragment(preferred_time: str, user_timezone: str) -> 
         return preferred_time.strip().lower()
 
 
+def _with_session_tracking(url: str, session_id: str) -> str:
+    """
+    Append the chat session_id as a Calendly UTM tracking param so the
+    invitee.created webhook (services/appointments/service.py) can match a
+    real booking back to the exact lead it was offered to, instead of only
+    being able to fall back to an email match.
+    """
+    if not url or not session_id:
+        return url
+    try:
+        from urllib.parse import urlencode, urlparse, parse_qsl, urlunparse
+
+        parts = urlparse(url)
+        query = dict(parse_qsl(parts.query))
+        query["utm_content"] = session_id
+        return urlunparse(parts._replace(query=urlencode(query)))
+    except Exception:
+        return url
+
+
 def _format_slots_for_tool(slots: list[dict[str, str]], user_timezone: str = "") -> str:
     if not slots:
         return "No available slots were found in the next 7 days."
@@ -305,14 +325,17 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
         description=(
             "Get real available appointment slots for the configured Calendly event type "
             "for the next 7 days. Returns times in the user's local timezone when user_timezone is provided. "
-            "Pass preferred_time as the user's stated preference (e.g. '7 pm', '14:00') and "
+            "Pass preferred_time as the user's stated preference (e.g. '7 pm', '14:00'), "
             "user_timezone as the IANA timezone string (e.g. 'Asia/Dhaka', 'America/New_York') "
-            "so slots are matched and displayed in the user's local time."
+            "so slots are matched and displayed in the user's local time, and session_id — the exact "
+            "current session_id value given to you in the system message — so a completed booking can "
+            "be matched back to this conversation's lead."
         ),
     )
     async def get_available_appointment_slots(
         preferred_time: str = "",
         user_timezone: str = "",
+        session_id: str = "",
     ) -> str:
         db = get_database()
         settings_doc = await get_user_calendly_settings(db, company_id)
@@ -342,7 +365,7 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
         payload = [
             {
                 "start_time": slot.start_time,
-                "scheduling_url": slot.scheduling_url,
+                "scheduling_url": _with_session_tracking(slot.scheduling_url, session_id),
             }
             for slot in slots[:8]
         ]
@@ -365,9 +388,10 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
         "get_slot_booking_link",
         description=(
             "Get the Calendly confirmation URL for a selected appointment slot. "
-            "Pass slot_start_time (ISO format, from the iso_start_time field in the slots output) "
-            "AND confirmation_url (the confirmation_url value from the same slot — avoids a second "
-            "Calendly API call). Use after the user picks a slot and shares their name/email. "
+            "Pass slot_start_time (ISO format, from the iso_start_time field in the slots output), "
+            "confirmation_url (the confirmation_url value from the same slot — avoids a second "
+            "Calendly API call), AND session_id (same current session_id as passed to "
+            "get_available_appointment_slots). Use after the user picks a slot and shares their name/email. "
             "Important: the link is a confirmation page only; appointment is NOT complete until "
             "the user finishes the Calendly form and confirms."
         ),
@@ -375,13 +399,14 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
     async def get_slot_booking_link(
         slot_start_time: str,
         confirmation_url: str = "",
+        session_id: str = "",
     ) -> str:
         target = slot_start_time.strip()
         if not target:
             return "Please provide a slot_start_time in ISO format."
 
         # If the LLM already has the URL from the prior get_available_appointment_slots
-        # output, use it directly — no need to call the Calendly API again.
+        # output, use it directly (already tracked) — no need to call the Calendly API again.
         if confirmation_url.strip():
             return (
                 f"Appointment confirmation page for {target}: {confirmation_url.strip()}. "
@@ -411,8 +436,9 @@ def _build_appointment_tools(company_id: str) -> list[Any]:
 
         for slot in slots:
             if slot.start_time == target:
+                tracked_url = _with_session_tracking(slot.scheduling_url, session_id)
                 return (
-                    f"Appointment confirmation page for {slot.start_time}: {slot.scheduling_url}. "
+                    f"Appointment confirmation page for {slot.start_time}: {tracked_url}. "
                     "Status: pending user completion."
                 )
 

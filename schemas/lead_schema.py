@@ -11,6 +11,7 @@ class LeadResponse(BaseModel):
     phone: Optional[str] = None
     message: Optional[str] = None
     is_contacted: bool = False
+    appointment_time: Optional[datetime] = None
     created_at: datetime
 
     class Config:

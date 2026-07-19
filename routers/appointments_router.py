@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any
 
 from bson import ObjectId
 from jose import JWTError, jwt
-from fastapi import APIRouter, Depends, HTTPException, Query, status, Header
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, Header
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel, Field
 
@@ -21,15 +23,20 @@ from model.appointments import (
 )
 from services.appointments import (
     delete_user_calendly_settings,
+    ensure_calendly_webhook,
     get_calendly_availability,
     get_calendly_events,
     get_calendly_stats,
     get_user_calendly_settings,
+    get_webhook_signing_key,
+    record_appointment_from_webhook,
     save_user_calendly_settings,
     test_calendly_connection,
+    verify_calendly_webhook_signature,
 )
 from services.appointments.service import CalendlyAPIError
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/appointments", tags=["Appointments"])
 
@@ -145,6 +152,13 @@ async def get_snapshot(
     return await _build_snapshot(db, current_user["id"])
 
 
+def _webhook_callback_url(company_id: str) -> str:
+    base = settings.BACKEND_PUBLIC_URL.rstrip("/")
+    if not base:
+        return ""
+    return f"{base}/api/appointments/calendly/webhook/{company_id}"
+
+
 @router.post("/calendly/connect")
 async def connect_token(
     payload: CalendlyConnectRequest,
@@ -163,6 +177,11 @@ async def connect_token(
         auto_embed=current.auto_embed,
     )
     await save_user_calendly_settings(db, current_user["id"], next_settings)
+    # So real bookings (not just offered slots) get recorded on the matching
+    # lead's appointment_time — see services/appointments/service.py.
+    await ensure_calendly_webhook(
+        db, current_user["id"], payload.access_token, _webhook_callback_url(current_user["id"]),
+    )
     return await _build_snapshot(db, current_user["id"])
 
 
@@ -279,3 +298,43 @@ async def availability(
     except CalendlyAPIError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc))
     return CalendlyAvailabilityResponse(slots=slots)
+
+
+# ── POST /appointments/calendly/webhook/{company_id} ─────────────────────────
+# Public — Calendly calls this directly (no dashboard auth). Verified instead
+# via the per-company signing key from ensure_calendly_webhook. Never raises
+# on a bad/unmatched payload — Calendly retries aggressively on non-2xx, and a
+# forged or stale request should just be dropped, not surfaced as a 500.
+@router.post("/calendly/webhook/{company_id}", include_in_schema=False)
+async def calendly_webhook(
+    company_id: str,
+    request: Request,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    raw_body = await request.body()
+    signature = request.headers.get("Calendly-Webhook-Signature")
+
+    signing_key = await get_webhook_signing_key(db, company_id)
+    if not signing_key or not verify_calendly_webhook_signature(signing_key, raw_body, signature):
+        logger.warning("calendly.webhook.invalid_signature company_id=%s", company_id)
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid signature")
+
+    try:
+        body = json.loads(raw_body)
+    except ValueError:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invalid JSON")
+
+    event_type = str(body.get("event") or "")
+    payload = body.get("payload") or {}
+
+    try:
+        await record_appointment_from_webhook(db, company_id, event_type, payload)
+    except Exception as exc:
+        logger.exception(
+            "calendly.webhook.handler_error company_id=%s event=%s error=%s",
+            company_id, event_type, exc,
+        )
+        # 200 anyway — don't make Calendly retry a bug on our side forever.
+        return {"received": True, "warning": "Handler error — check server logs."}
+
+    return {"received": True}

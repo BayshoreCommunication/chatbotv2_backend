@@ -58,5 +58,10 @@ class AppointmentSettingsDoc(BaseModel):
     calendly_access_token: str = ""
     event_type_uri: str = ""
     auto_embed: bool = True
+    # Internal bookkeeping for the webhook subscription created with Calendly
+    # so real bookings can be recorded on the matching lead — never exposed
+    # to the frontend (not part of CalendlySettings).
+    calendly_webhook_uri: str = ""
+    calendly_webhook_signing_key: str = ""
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)

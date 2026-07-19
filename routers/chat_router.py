@@ -370,6 +370,13 @@ async def chat(company_id: str, payload: ChatRequest):
             "Use this for all scheduling and slot display. "
             "Do not ask for timezone unless the user explicitly requests a change.",
         ))
+    input_messages.append((
+        "system",
+        f"Current session_id: {payload.session_id!r}. When calling "
+        "get_available_appointment_slots or get_slot_booking_link, always pass this exact "
+        "value as the session_id argument — it lets a completed booking be matched back to "
+        "this conversation's lead. Never ask the user for it or mention it to them.",
+    ))
     input_messages.append(("user", payload.message))
 
     t_invoke = time.monotonic()

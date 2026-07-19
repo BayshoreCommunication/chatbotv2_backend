@@ -33,6 +33,11 @@ class Settings(BaseSettings):
 
     # ── Calendly ──────────────────────────────────────────────────────────────
     CALENDLY_API_KEY: str
+    # Publicly reachable base URL for THIS backend (e.g. https://api.example.com)
+    # — used to register the Calendly webhook callback. Left blank in local dev,
+    # where Calendly can't reach localhost; webhook registration is skipped
+    # (logged, not fatal) until this is set.
+    BACKEND_PUBLIC_URL: str = ""
 
     # ── DigitalOcean Spaces ───────────────────────────────────────────────────
     DO_SPACES_KEY: str = ""

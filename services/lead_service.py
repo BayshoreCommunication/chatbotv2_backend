@@ -24,6 +24,7 @@ def serialize_lead(lead: dict) -> dict:
         "phone": lead.get("phone"),
         "message": lead.get("message"),
         "is_contacted": lead.get("is_contacted", False),
+        "appointment_time": lead.get("appointment_time"),
         "created_at": lead.get("created_at"),
         "updated_at": lead.get("updated_at"),
     }
@@ -82,6 +83,52 @@ async def set_lead_contacted(
         logger.info(
             "leads.api.contacted_updated company_id=%s lead_id=%s is_contacted=%s",
             company_id, lead_id, is_contacted,
+        )
+    return serialize_lead(result) if result else None
+
+
+async def set_lead_appointment_time(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    appointment_time: Optional[datetime],
+    session_id: Optional[str] = None,
+    email: Optional[str] = None,
+) -> Optional[dict]:
+    """
+    Record (or clear, on cancellation — pass appointment_time=None) a confirmed
+    Calendly booking on the matching lead. Matches by session_id first (precise
+    — embedded as a UTM tracking param on the booking link the chatbot shares,
+    see services/chatbot/tools.py), falling back to the most recently created
+    lead with the same email for this company if Calendly didn't echo the
+    tracking param back (e.g. the visitor edited the URL).
+    """
+    query: dict = {"company_id": company_id}
+    if session_id:
+        query["session_id"] = session_id
+    elif email:
+        query["email"] = email
+    else:
+        logger.warning(
+            "leads.appointment.no_identifier company_id=%s — cannot match a lead",
+            company_id,
+        )
+        return None
+
+    result = await db["leads"].find_one_and_update(
+        query,
+        {"$set": {"appointment_time": appointment_time, "updated_at": datetime.utcnow()}},
+        sort=[("created_at", -1)],
+        return_document=ReturnDocument.AFTER,
+    )
+    if result:
+        logger.info(
+            "leads.appointment.updated company_id=%s lead_id=%s appointment_time=%s",
+            company_id, result["_id"], appointment_time,
+        )
+    else:
+        logger.warning(
+            "leads.appointment.no_match company_id=%s session_id=%s email=%s",
+            company_id, session_id, email,
         )
     return serialize_lead(result) if result else None
 
