@@ -14,7 +14,7 @@ class BehaviorSettings(BaseModel):
 
 
 class ContentSettings(BaseModel):
-    welcome_message: str = "Hello! 👋 Welcome to Bayshore Communication. How can I assist you today?"
+    welcome_message: str = "Hello! 👋 Welcome to GoConverto. How can I assist you today?"
     welcome_video: str = ""
     welcome_video_autoplay: bool = True
     input_placeholder: str = "Type your question here..."

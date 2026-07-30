@@ -39,6 +39,19 @@ class Settings(BaseSettings):
     # (logged, not fatal) until this is set.
     BACKEND_PUBLIC_URL: str = ""
 
+    # ── Meta (WhatsApp / Messenger / Instagram) ──────────────────────────────
+    # Shared across all companies — one Meta Developer App serves every
+    # connected number/page. Per-company credentials (phone_number_id,
+    # access_token, business_account_id) live in Mongo instead, see
+    # model/apps_integration.py.
+    META_APP_ID: str = ""
+    META_APP_SECRET: str = ""
+    META_WEBHOOK_VERIFY_TOKEN: str = ""
+    # Base URL this backend calls itself on to reach POST /chat/{company_id}
+    # from the WhatsApp webhook — always localhost, not BACKEND_PUBLIC_URL,
+    # since this is a same-process/same-machine call, not Meta calling us.
+    INTERNAL_API_BASE_URL: str = "http://127.0.0.1:8000"
+
     # ── DigitalOcean Spaces ───────────────────────────────────────────────────
     DO_SPACES_KEY: str = ""
     DO_SPACES_SECRET: str = ""

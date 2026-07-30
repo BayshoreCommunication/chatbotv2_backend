@@ -22,6 +22,7 @@ from routers import (
     admin_route,
     invite_router,
     team_access_router,
+    apps_integration_router,
 )
 from routers.chat_router import widget_router
 from services.admin.admin_auth import seed_super_admin
@@ -81,6 +82,7 @@ app.include_router(notification_router.router,      prefix="/api/v1")
 app.include_router(admin_route.router,              prefix="/api/v1")
 app.include_router(invite_router.router,            prefix="/api/v1")
 app.include_router(team_access_router.router,       prefix="/api/v1")
+app.include_router(apps_integration_router.router,  prefix="/api")
 
 
 @app.get("/", tags=["Health"])
