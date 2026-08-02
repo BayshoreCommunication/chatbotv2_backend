@@ -39,18 +39,26 @@ class Settings(BaseSettings):
     # (logged, not fatal) until this is set.
     BACKEND_PUBLIC_URL: str = ""
 
-    # ── Meta (WhatsApp / Messenger / Instagram) ──────────────────────────────
+    # ── Meta (Messenger, later Instagram) ─────────────────────────────────────
     # Shared across all companies — one Meta Developer App serves every
-    # connected number/page. Per-company credentials (phone_number_id,
-    # access_token, business_account_id) live in Mongo instead, see
-    # model/apps_integration.py.
+    # connected page. Per-company credentials (page_id, access_token) live
+    # in Mongo instead, see model/apps_integration_model.py.
     META_APP_ID: str = ""
     META_APP_SECRET: str = ""
     META_WEBHOOK_VERIFY_TOKEN: str = ""
+    META_GRAPH_API_VERSION: str = "v21.0"
+    # Not currently read anywhere in the backend — reserved for the OAuth
+    # connect flow being built against ChannelConnectionDoc.
+    META_OAUTH_REDIRECT_URI: str = ""
     # Base URL this backend calls itself on to reach POST /chat/{company_id}
-    # from the WhatsApp webhook — always localhost, not BACKEND_PUBLIC_URL,
+    # from a channel webhook — always localhost, not BACKEND_PUBLIC_URL,
     # since this is a same-process/same-machine call, not Meta calling us.
     INTERNAL_API_BASE_URL: str = "http://127.0.0.1:8000"
+    # 64 hex chars (32 raw bytes) — AES-256-GCM key for encrypting connected
+    # channels' access tokens at rest (see utils/token_encryption.py).
+    # Generate with: openssl rand -hex 32. Losing/rotating this makes every
+    # already-stored token undecryptable, so back it up somewhere durable.
+    TOKEN_ENCRYPTION_KEY: str = ""
 
     # ── DigitalOcean Spaces ───────────────────────────────────────────────────
     DO_SPACES_KEY: str = ""
