@@ -1,29 +1,28 @@
 import logging
-
 from contextlib import asynccontextmanager
+
+from database import close_mongo_connection, connect_to_mongo, get_database
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-from database import connect_to_mongo, close_mongo_connection, get_database
 from routers import (
-    user_router,
-    auth_router,
-    chat_router,
-    knowledge_router,
-    appointments_router,
-    user_profile_router,
-    lead_router,
-    widget_settings,
-    upload_router,
-    subscription_router,
-    billing_router,
-    dashboard_router,
-    notification_router,
     admin_route,
-    invite_router,
-    team_access_router,
+    appointments_router,
     apps_integration_router,
+    auth_router,
+    billing_router,
+    chat_router,
+    dashboard_router,
+    invite_router,
+    knowledge_router,
+    lead_router,
     meta_webhook_router,
+    notification_router,
+    subscription_router,
+    team_access_router,
+    upload_router,
+    user_profile_router,
+    user_router,
+    widget_settings,
 )
 from routers.chat_router import widget_router
 from services.admin.admin_auth import seed_super_admin
@@ -66,25 +65,25 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
-app.include_router(auth_router.router,      prefix="/api/v1")
-app.include_router(user_router.router,      prefix="/api/v1")
-app.include_router(chat_router.router,      prefix="/api/v1")
+app.include_router(auth_router.router, prefix="/api/v1")
+app.include_router(user_router.router, prefix="/api/v1")
+app.include_router(chat_router.router, prefix="/api/v1")
 app.include_router(knowledge_router.router, prefix="/api/v1")
 app.include_router(appointments_router.router, prefix="/api")
 app.include_router(user_profile_router.router, prefix="/api")
 app.include_router(lead_router.router, prefix="/api/v1")
 app.include_router(widget_settings.router, prefix="/api/v1")
-app.include_router(upload_router.router,   prefix="/api/v1")
-app.include_router(widget_router,                   prefix="/api")
-app.include_router(subscription_router.router,      prefix="/api/v1")
-app.include_router(billing_router.router,           prefix="/api/v1")
-app.include_router(dashboard_router.router,         prefix="/api/v1")
-app.include_router(notification_router.router,      prefix="/api/v1")
-app.include_router(admin_route.router,              prefix="/api/v1")
-app.include_router(invite_router.router,            prefix="/api/v1")
-app.include_router(team_access_router.router,       prefix="/api/v1")
-app.include_router(apps_integration_router.router,  prefix="/api")
-app.include_router(meta_webhook_router.router,      prefix="/api")
+app.include_router(upload_router.router, prefix="/api/v1")
+app.include_router(widget_router, prefix="/api")
+app.include_router(subscription_router.router, prefix="/api/v1")
+app.include_router(billing_router.router, prefix="/api/v1")
+app.include_router(dashboard_router.router, prefix="/api/v1")
+app.include_router(notification_router.router, prefix="/api/v1")
+app.include_router(admin_route.router, prefix="/api/v1")
+app.include_router(invite_router.router, prefix="/api/v1")
+app.include_router(team_access_router.router, prefix="/api/v1")
+app.include_router(apps_integration_router.router, prefix="/api")
+app.include_router(meta_webhook_router.router, prefix="/api")
 
 
 @app.get("/", tags=["Health"])
@@ -96,5 +95,5 @@ if __name__ == "__main__":
     import uvicorn
 
     # host="0.0.0.0" = accept connections from any device on the network
-    # (phone, emulator, etc.), not just this machine.
+    # (phone, emulator, etc.), not just this machine
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
