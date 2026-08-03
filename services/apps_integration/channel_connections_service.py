@@ -188,7 +188,9 @@ async def exchange_code_and_list_pages(db: AsyncIOMotorDatabase, company_id: str
     Pages -> stashed (encrypted) pending selection. Returns a selection_id
     for the dashboard to fetch via get_pending_selection."""
     try:
-        short_lived = await _exchange_code_for_short_lived_user_token(code)
+        short_lived = await _exchange_code_for_short_lived_user_token(
+            code, settings.META_OAUTH_REDIRECT_URI
+        )
         user_access_token = await _exchange_for_long_lived_user_token(short_lived)
     except MetaOAuthExchangeError as exc:
         raise ChannelOAuthError(str(exc)) from exc

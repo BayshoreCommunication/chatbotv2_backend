@@ -59,12 +59,22 @@ class MessengerEmbeddedSignupError(Exception):
     pass
 
 
-async def _exchange_code_for_short_lived_user_token(code: str) -> str:
+async def _exchange_code_for_short_lived_user_token(
+    code: str, redirect_uri: str = ""
+) -> str:
+    """`redirect_uri` must be byte-identical to whatever redirect_uri (if
+    any) was used in the request that minted this code — Meta rejects a
+    mismatch with error_subcode 36008. The JS-SDK Login for Business flow
+    (Messenger's connect-embedded) never sends one, so its caller leaves
+    this blank; the server-redirect OAuth flow must pass the same
+    settings.META_OAUTH_REDIRECT_URI used in build_authorize_url."""
     params = {
         "client_id": settings.META_APP_ID,
         "client_secret": settings.META_APP_SECRET,
         "code": code,
     }
+    if redirect_uri:
+        params["redirect_uri"] = redirect_uri
     async with httpx.AsyncClient(timeout=20.0) as client:
         resp = await client.get(
             f"{GRAPH_API_BASE_URL}/oauth/access_token", params=params

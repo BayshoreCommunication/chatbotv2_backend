@@ -279,7 +279,7 @@ async def channel_oauth_callback(
     hence identifying the company via the signed `state` param instead of
     get_current_user. Always redirects onward to the dashboard; never
     returns raw JSON, since this is a full-page browser navigation."""
-    dashboard_url = f"{settings.FRONTEND_URL}/dashboard/apps-integration"
+    dashboard_url = f"{settings.FRONTEND_URL}/apps-integration"
 
     if error or not code or not state:
         logger.warning("channel_oauth.callback_denied error=%s", error or "missing code/state")
