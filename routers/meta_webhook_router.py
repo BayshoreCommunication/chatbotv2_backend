@@ -3,7 +3,7 @@ routers/meta_webhook_router.py
 ─────────────────────────────────
 Single shared Meta webhook endpoint — POST /api/webhooks/meta — covering
 every channel connected through the multi-connection `channel_connections`
-model (Messenger + Instagram today, see services/apps_integration/
+model (Messenger, Instagram, and WhatsApp — see services/apps_integration/
 channel_connections_service.py). Distinct from the legacy per-channel
 webhook at /apps-integration/messenger/webhook (apps_integration_router.py),
 which still serves the older single-connection Messenger flow — the two
@@ -28,6 +28,7 @@ from database import get_database
 from model.apps_integration_model import ChannelType
 from services.apps_integration import (
     handle_incoming_channel_message,
+    handle_incoming_whatsapp_message,
     verify_meta_webhook_signature,
 )
 
@@ -63,6 +64,11 @@ async def receive_meta_webhook(
 
     body = await request.json()
     object_type = body.get("object")
+
+    if object_type == "whatsapp_business_account":
+        _queue_whatsapp_messages(body, background_tasks, db)
+        return {"received": True}
+
     if object_type == "page":
         channel = ChannelType.messenger
     elif object_type == "instagram":
@@ -100,3 +106,32 @@ async def receive_meta_webhook(
     # Always 200 — Meta retries aggressively on non-2xx, and a bug on our
     # side shouldn't turn into an infinite retry storm.
     return {"received": True}
+
+
+def _queue_whatsapp_messages(
+    body: dict, background_tasks: BackgroundTasks, db: AsyncIOMotorDatabase,
+) -> None:
+    """WhatsApp's payload shape is entry[].changes[].value.messages[], not
+    Messenger/Instagram's entry[].messaging[] — different enough to warrant
+    its own parsing loop rather than shoehorning it into the shared one
+    above. The connection lookup key is value.metadata.phone_number_id, not
+    entry.id (that's the WABA id, a different thing we don't store)."""
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            phone_number_id = str(value.get("metadata", {}).get("phone_number_id") or "")
+            for message in value.get("messages", []):
+                # Non-text events (images, reactions, status updates) skipped
+                # for now — text-only, matching the Messenger/Instagram path.
+                if message.get("type") != "text":
+                    continue
+                sender_wa_id = str(message.get("from") or "")
+                message_id = str(message.get("id") or "")
+                message_text = str(message.get("text", {}).get("body") or "")
+                if not (phone_number_id and sender_wa_id and message_id and message_text):
+                    continue
+
+                background_tasks.add_task(
+                    handle_incoming_whatsapp_message,
+                    db, phone_number_id, sender_wa_id, message_id, message_text,
+                )

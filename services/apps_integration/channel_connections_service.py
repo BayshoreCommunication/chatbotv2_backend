@@ -551,3 +551,160 @@ async def handle_incoming_channel_message(
             "channel_message.handler_error channel=%s external_id=%s message_id=%s",
             channel.value, external_id, message_id,
         )
+
+
+# ═══ WhatsApp (Embedded Signup) ═════════════════════════════════════════════
+# Structurally different from Messenger/Instagram: WhatsApp's Send API and
+# webhook payload shape aren't the shared /me/messages + entry[].messaging[]
+# format, so it gets its own send/receive functions rather than being forced
+# through send_meta_message/handle_incoming_channel_message. Everything else
+# (ChannelConnectionDoc, token encryption, connection listing/disconnect) is
+# already channel-agnostic and reused as-is.
+
+
+async def connect_whatsapp_embedded(
+    db: AsyncIOMotorDatabase, company_id: str, code: str, phone_number_id: str, waba_id: str,
+) -> ChannelConnectionDoc:
+    """Full Embedded Signup pipeline: code -> long-lived token -> subscribe
+    the WABA -> save. `phone_number_id`/`waba_id` come from the frontend's
+    WA_EMBEDDED_SIGNUP postMessage event, not looked up here — Meta's own
+    signup wizard is what let the user pick/create them."""
+    try:
+        short_lived = await _exchange_code_for_short_lived_user_token(code)
+        access_token = await _exchange_for_long_lived_user_token(short_lived)
+    except MetaOAuthExchangeError as exc:
+        raise ChannelOAuthError(str(exc)) from exc
+
+    # Best-effort — a subscribe failure shouldn't block the connection from
+    # saving (same lesson as the Page/Instagram subscribe calls above: Meta
+    # rejecting this call is recoverable, losing the connection entirely isn't).
+    try:
+        await subscribe_page_to_app(waba_id, access_token)
+    except MetaSendError as exc:
+        logger.warning(
+            "whatsapp_connect.subscribe_failed waba_id=%s error=%s", waba_id, exc,
+        )
+
+    display_name = await _fetch_whatsapp_display_name(phone_number_id, access_token)
+
+    return await save_channel_connection(
+        db, company_id, ChannelType.whatsapp, phone_number_id, access_token,
+        display_name or phone_number_id,
+    )
+
+
+async def _fetch_whatsapp_display_name(phone_number_id: str, access_token: str) -> str:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(
+            f"{GRAPH_API_BASE_URL}/{phone_number_id}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params={"fields": "verified_name,display_phone_number"},
+        )
+    if resp.status_code >= 400:
+        logger.warning(
+            "whatsapp_connect.name_lookup_failed phone_number_id=%s status=%d body=%s",
+            phone_number_id, resp.status_code, resp.text,
+        )
+        return ""
+    body = resp.json()
+    return str(body.get("verified_name") or body.get("display_phone_number") or "")
+
+
+async def send_whatsapp_message(access_token: str, phone_number_id: str, to: str, text: str) -> None:
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.post(
+            f"{GRAPH_API_BASE_URL}/{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "to": to,
+                "type": "text",
+                "text": {"body": text},
+            },
+        )
+    if resp.status_code >= 400:
+        body = resp.json() if "application/json" in resp.headers.get("content-type", "") else {}
+        error = body.get("error", {})
+        logger.error(
+            "whatsapp_send.failed status=%d error_type=%s error_code=%s",
+            resp.status_code, error.get("type"), error.get("code"),
+        )
+        if error.get("type") == "OAuthException" or error.get("code") == 190:
+            raise MetaTokenExpiredError("WhatsApp access token is invalid or expired")
+        raise MetaSendError(f"WhatsApp send failed: {resp.status_code}")
+
+
+async def handle_incoming_whatsapp_message(
+    db: AsyncIOMotorDatabase,
+    phone_number_id: str,
+    sender_wa_id: str,
+    message_id: str,
+    message_text: str,
+) -> None:
+    """Full pipeline for one incoming WhatsApp message: dedupe, find the
+    owning connection, ask the AI, send the reply back. Never raises — a
+    forged/unmatched/errored message should be dropped, not surfaced as a
+    500 (Meta retries aggressively on non-2xx responses)."""
+    try:
+        if await is_duplicate_message(db, CHANNEL_PROCESSED_MESSAGES_COLLECTION, message_id):
+            logger.info("whatsapp_message.duplicate_skipped message_id=%s", message_id)
+            return
+
+        connection = await get_channel_connection_by_external_id(
+            db, ChannelType.whatsapp, phone_number_id
+        )
+        if not connection:
+            logger.warning(
+                "whatsapp_message.unmatched_external_id phone_number_id=%s", phone_number_id,
+            )
+            return
+
+        if connection.status != ConnectionStatus.active:
+            logger.info(
+                "whatsapp_message.inactive_connection phone_number_id=%s status=%s",
+                phone_number_id, connection.status.value,
+            )
+            return
+
+        try:
+            access_token = decrypt_token(connection.encrypted_access_token)
+        except TokenEncryptionError:
+            logger.error(
+                "whatsapp_message.token_decrypt_failed phone_number_id=%s", phone_number_id,
+            )
+            return
+
+        # WhatsApp has no separate "session" concept — the sender's wa_id
+        # itself is the session, so the same conversation always resumes
+        # with the same history.
+        reply = await get_ai_reply(
+            "whatsapp", connection.company_id, session_id=sender_wa_id, message=message_text
+        )
+        if not reply:
+            return
+
+        try:
+            await send_whatsapp_message(access_token, phone_number_id, sender_wa_id, reply)
+            logger.info(
+                "whatsapp_message.reply_sent phone_number_id=%s recipient_id=%s",
+                phone_number_id, sender_wa_id,
+            )
+        except MetaTokenExpiredError:
+            logger.warning(
+                "whatsapp_message.token_expired phone_number_id=%s", phone_number_id,
+            )
+            await mark_channel_connection_status(
+                db, ChannelType.whatsapp, phone_number_id, ConnectionStatus.token_expired
+            )
+        except MetaSendError:
+            logger.exception(
+                "whatsapp_message.send_failed phone_number_id=%s", phone_number_id,
+            )
+    except Exception:
+        logger.exception(
+            "whatsapp_message.handler_error phone_number_id=%s message_id=%s",
+            phone_number_id, message_id,
+        )

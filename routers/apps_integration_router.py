@@ -28,6 +28,11 @@ Endpoints:
   POST   /apps-integration/oauth/confirm                     — save + subscribe the chosen Page(s)
   GET    /apps-integration/oauth/connections                 — list this company's channel_connections
   DELETE /apps-integration/oauth/connections/{channel}/{external_id} — disconnect one
+
+  POST   /apps-integration/whatsapp/connect-embedded         — WhatsApp Embedded Signup: exchange the
+                                                                 code + phone_number_id + waba_id Meta hands
+                                                                 back, subscribe, save. Listing/disconnect
+                                                                 reuse the /oauth/connections endpoints above.
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ from services.apps_integration import (
     build_authorize_url,
     confirm_channel_connections,
     connect_messenger_embedded,
+    connect_whatsapp_embedded,
     decode_oauth_state,
     delete_company_messenger_settings,
     disconnect_channel_connection,
@@ -71,6 +77,7 @@ from model.apps_integration_model import (
     OAuthConfirmRequest,
     OAuthInitiateResponse,
     OAuthPendingSelectionResponse,
+    WhatsAppEmbeddedConnectRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -361,3 +368,33 @@ async def disconnect_channel_oauth_connection(
     if not found:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Connection not found")
     return {"ok": True}
+
+
+# ── WhatsApp: Embedded Signup ────────────────────────────────────────────────
+# One-click connect — Meta's own signup wizard handles WABA/phone number
+# creation and verification, the frontend just relays the resulting code +
+# phone_number_id + waba_id here. Listing/disconnect reuse the generic
+# /oauth/connections endpoints above (ChannelType.whatsapp included for free).
+
+
+@router.post("/whatsapp/connect-embedded", response_model=ChannelConnectionSummary)
+async def connect_whatsapp_via_embedded_signup(
+    payload: WhatsAppEmbeddedConnectRequest,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict[str, Any] = Depends(get_current_user),
+):
+    try:
+        connection = await connect_whatsapp_embedded(
+            db,
+            current_user["id"],
+            code=payload.code,
+            phone_number_id=payload.phone_number_id,
+            waba_id=payload.waba_id,
+        )
+    except ChannelOAuthError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    return ChannelConnectionSummary(
+        id=connection.id or "", channel=connection.channel, external_id=connection.external_id,
+        page_name=connection.page_name, status=connection.status, connected_at=connection.connected_at,
+    )

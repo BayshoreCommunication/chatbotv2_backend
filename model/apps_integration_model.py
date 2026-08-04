@@ -64,6 +64,19 @@ class MessengerSettingsDoc(BaseModel):
 # class InstagramSettings(BaseModel): ...
 
 
+# ── WhatsApp (Embedded Signup) ─────────────────────────────────────────────
+# The frontend's FB.login() WhatsApp Embedded Signup flow hands back a short-
+# lived authorization `code` (exchanged server-side, same helpers Messenger's
+# embedded flow uses) plus `phone_number_id`/`waba_id` read directly off the
+# WA_EMBEDDED_SIGNUP postMessage event Meta fires during the flow — unlike
+# Messenger, there's no page to resolve afterward, Meta hands us the exact
+# phone number/account the user picked in its own signup wizard.
+class WhatsAppEmbeddedConnectRequest(BaseModel):
+    code: str = Field(..., min_length=1)
+    phone_number_id: str = Field(..., min_length=1)
+    waba_id: str = Field(..., min_length=1)
+
+
 # ── Unified channel connections (Messenger + Instagram) ────────────────────────
 # The multi-connection model: one row per (company, channel, external
 # Page/IG account), letting a company connect more than one Page. Wired into
@@ -75,6 +88,7 @@ class MessengerSettingsDoc(BaseModel):
 class ChannelType(str, Enum):
     messenger = "messenger"
     instagram = "instagram"
+    whatsapp = "whatsapp"
 
 
 class ConnectionStatus(str, Enum):

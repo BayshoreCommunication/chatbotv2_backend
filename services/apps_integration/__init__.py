@@ -15,12 +15,15 @@ from services.apps_integration.channel_connections_service import (
     MetaTokenExpiredError,
     build_authorize_url,
     confirm_channel_connections,
+    connect_whatsapp_embedded,
     decode_oauth_state,
     disconnect_channel_connection,
     exchange_code_and_list_pages,
     get_pending_selection,
     handle_incoming_channel_message,
+    handle_incoming_whatsapp_message,
     list_company_channel_connections,
+    send_whatsapp_message,
 )
 
 __all__ = [
@@ -38,10 +41,13 @@ __all__ = [
     "MetaTokenExpiredError",
     "build_authorize_url",
     "confirm_channel_connections",
+    "connect_whatsapp_embedded",
     "decode_oauth_state",
     "disconnect_channel_connection",
     "exchange_code_and_list_pages",
     "get_pending_selection",
     "handle_incoming_channel_message",
+    "handle_incoming_whatsapp_message",
     "list_company_channel_connections",
+    "send_whatsapp_message",
 ]
