@@ -295,6 +295,18 @@ async def confirm_channel_connections(
         ))
 
         if candidate.get("linked_instagram_id"):
+            # Subscribing the Page alone isn't enough for Instagram — Meta
+            # requires the linked IG professional account itself to be
+            # subscribed too, or it never delivers "instagram"-object
+            # webhook events even though the Page's "messages" field fires
+            # fine for Messenger.
+            try:
+                await subscribe_page_to_app(candidate["linked_instagram_id"], page_token)
+            except MetaSendError as exc:
+                raise ChannelOAuthError(
+                    f"Connected to Facebook, but couldn't subscribe the linked Instagram account to webhooks: {exc}"
+                ) from exc
+
             saved.append(await save_channel_connection(
                 db,
                 company_id,
