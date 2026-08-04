@@ -529,6 +529,10 @@ async def handle_incoming_channel_message(
 
         try:
             await send_meta_message(access_token, sender_id, reply)
+            logger.info(
+                "channel_message.reply_sent channel=%s external_id=%s recipient_id=%s",
+                channel.value, external_id, sender_id,
+            )
         except MetaTokenExpiredError:
             logger.warning(
                 "channel_message.token_expired channel=%s external_id=%s",
