@@ -61,11 +61,6 @@ class AdminListResponse(BaseModel):
 
 # ── Platform stats (cross-company, for the admin dashboard) ──────────────────
 
-class SignupMonth(BaseModel):
-    month: str   # e.g. "Jan 2026"
-    count: int
-
-
 class AdminPlatformStats(BaseModel):
     total_companies: int
     active_subscriptions: int
@@ -75,4 +70,20 @@ class AdminPlatformStats(BaseModel):
     trained_companies: int
     avg_kb_score: float
     plan_distribution: dict[str, int]
-    signups_by_month: list[SignupMonth]
+
+
+# ── Sign-up trends (monthly/yearly, for the overview chart) ───────────────────
+
+SignupTrendPeriod = Literal["monthly", "yearly"]
+
+
+class SignupTrendPoint(BaseModel):
+    label: str            # "Jan 2026" for monthly, "2026" for yearly
+    signups: int           # new companies created
+    leads: int             # leads captured across every company's chatbot
+    conversions: int       # companies whose paid subscription started in this bucket
+
+
+class SignupTrendsResponse(BaseModel):
+    period: SignupTrendPeriod
+    points: list[SignupTrendPoint]

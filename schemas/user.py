@@ -2,7 +2,7 @@ from typing import Optional, Literal
 from datetime import datetime
 from pydantic import BaseModel, EmailStr, Field, HttpUrl
 
-SubscriptionType = Literal["free", "starter", "professional", "enterprise"]
+SubscriptionType = Literal["free", "professional", "advanced", "enterprise"]
 CompanyType = Literal[
     "tech-company",
     "law-firm",

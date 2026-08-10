@@ -6,6 +6,7 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 
 from model.notification_model import NotificationModel, NotificationType
+from services.chatbot.ws_manager import ws_manager
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,24 @@ async def _insert(
         "notifications.created company_id=%s type=%s notification_id=%s lead_id=%s session_id=%s",
         company_id, type_, result.inserted_id, lead_id, session_id,
     )
+
+    # Best-effort real-time push to every connected admin-panel tab. Every
+    # notification (any company, any type) goes through this one function,
+    # so this is the single choke point that makes the admin bell live —
+    # never let a lookup/socket hiccup break the actual notification write.
+    try:
+        company_name = None
+        if ObjectId.is_valid(company_id):
+            company = await db["users"].find_one({"_id": ObjectId(company_id)}, {"company_name": 1})
+            company_name = company.get("company_name") if company else None
+
+        payload = serialize_notification({**notification.model_dump(), "_id": result.inserted_id})
+        payload["company_name"] = company_name or "Unknown company"
+        payload["created_at"] = notification.created_at.isoformat()  # datetime isn't JSON-serializable as-is
+
+        await ws_manager.notify_admin({"type": "notification", "notification": payload})
+    except Exception:
+        logger.warning("notifications.admin_push_failed notification_id=%s", result.inserted_id, exc_info=True)
 
 
 async def create_lead_notification(

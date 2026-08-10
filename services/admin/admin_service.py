@@ -92,8 +92,6 @@ async def get_platform_stats(db: AsyncIOMotorDatabase) -> dict:
     companies exist — no need to ship full user documents to the client just
     to count them.
     """
-    twelve_months_ago = datetime.now(timezone.utc) - timedelta(days=365)
-
     facet_cursor = db["users"].aggregate([
         {"$facet": {
             "verified": [
@@ -109,13 +107,6 @@ async def get_platform_stats(db: AsyncIOMotorDatabase) -> dict:
             ],
             "plan_distribution": [
                 {"$group": {"_id": "$subscription_type", "count": {"$sum": 1}}},
-            ],
-            "signups_by_month": [
-                {"$match": {"created_at": {"$gte": twelve_months_ago}}},
-                {"$group": {
-                    "_id": {"year": {"$year": "$created_at"}, "month": {"$month": "$created_at"}},
-                    "count": {"$sum": 1},
-                }},
             ],
         }},
     ])
@@ -155,26 +146,6 @@ async def get_platform_stats(db: AsyncIOMotorDatabase) -> dict:
     avg_kb_score = facets["avg_score"][0]["avg"] if facets["avg_score"] and facets["avg_score"][0]["avg"] else 0.0
     plan_distribution = {row["_id"] or "free": row["count"] for row in facets["plan_distribution"]}
 
-    # Fill every one of the trailing 12 months so the chart has no gaps,
-    # even for months with zero sign-ups.
-    counts_by_key = {
-        (row["_id"]["year"], row["_id"]["month"]): row["count"]
-        for row in facets["signups_by_month"]
-    }
-    now = datetime.now(timezone.utc)
-    signups_by_month = []
-    for i in range(11, -1, -1):
-        year = now.year
-        month = now.month - i
-        while month <= 0:
-            month += 12
-            year -= 1
-        label = datetime(year, month, 1).strftime("%b %Y")
-        signups_by_month.append({
-            "month": label,
-            "count": counts_by_key.get((year, month), 0),
-        })
-
     return {
         "total_companies": total_companies,
         "active_subscriptions": active_subscriptions,
@@ -184,8 +155,87 @@ async def get_platform_stats(db: AsyncIOMotorDatabase) -> dict:
         "trained_companies": trained_companies,
         "avg_kb_score": round(avg_kb_score, 1),
         "plan_distribution": plan_distribution,
-        "signups_by_month": signups_by_month,
     }
+
+
+def _trend_bucket_key(period: str, doc_id: dict) -> tuple:
+    if period == "yearly":
+        return (doc_id["year"],)
+    return (doc_id["year"], doc_id["month"])
+
+
+async def get_signup_trends(db: AsyncIOMotorDatabase, period: str = "monthly") -> dict:
+    """
+    Monthly (trailing 12 months) or yearly (trailing 5 years) breakdown of
+    sign-ups, leads captured, and trial→paid conversions — all cross-company,
+    for the admin dashboard's overview chart. Every bucket is zero-filled so
+    the chart never has gaps.
+    """
+    now = datetime.now(timezone.utc)
+    num_buckets = 5 if period == "yearly" else 12
+
+    if period == "yearly":
+        start = datetime(now.year - num_buckets + 1, 1, 1, tzinfo=timezone.utc)
+        group_key = {"year": {"$year": "$created_at"}}
+        conv_group_key = {"year": {"$year": "$subscription_start_date"}}
+    else:
+        start = now - timedelta(days=365)
+        group_key = {"year": {"$year": "$created_at"}, "month": {"$month": "$created_at"}}
+        conv_group_key = {
+            "year": {"$year": "$subscription_start_date"},
+            "month": {"$month": "$subscription_start_date"},
+        }
+
+    signups_cursor = db["users"].aggregate([
+        {"$match": {"created_at": {"$gte": start}}},
+        {"$group": {"_id": group_key, "count": {"$sum": 1}}},
+    ])
+    signups_by_key = {
+        _trend_bucket_key(period, row["_id"]): row["count"] async for row in signups_cursor
+    }
+
+    leads_cursor = db["leads"].aggregate([
+        {"$match": {"created_at": {"$gte": start}}},
+        {"$group": {"_id": group_key, "count": {"$sum": 1}}},
+    ])
+    leads_by_key = {
+        _trend_bucket_key(period, row["_id"]): row["count"] async for row in leads_cursor
+    }
+
+    # A "conversion" = a company whose paid subscription started in this
+    # bucket — has_paid_subscription is only ever set True once Stripe
+    # confirms an active (non-trial, non-free) subscription.
+    conversions_cursor = db["users"].aggregate([
+        {"$match": {"has_paid_subscription": True, "subscription_start_date": {"$gte": start}}},
+        {"$group": {"_id": conv_group_key, "count": {"$sum": 1}}},
+    ])
+    conversions_by_key = {
+        _trend_bucket_key(period, row["_id"]): row["count"] async for row in conversions_cursor
+    }
+
+    points = []
+    for i in range(num_buckets - 1, -1, -1):
+        if period == "yearly":
+            year = now.year - i
+            key = (year,)
+            label = str(year)
+        else:
+            year = now.year
+            month = now.month - i
+            while month <= 0:
+                month += 12
+                year -= 1
+            key = (year, month)
+            label = datetime(year, month, 1).strftime("%b %Y")
+
+        points.append({
+            "label": label,
+            "signups": signups_by_key.get(key, 0),
+            "leads": leads_by_key.get(key, 0),
+            "conversions": conversions_by_key.get(key, 0),
+        })
+
+    return {"period": period, "points": points}
 
 
 async def delete_admin(db: AsyncIOMotorDatabase, admin_id: str) -> bool:
