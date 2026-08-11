@@ -15,6 +15,7 @@ def _serialize(doc: dict) -> dict:
         "behavior": doc.get("behavior"),
         "content": doc.get("content"),
         "launcher": doc.get("launcher"),
+        "embed_type": doc.get("embed_type", "custom"),
     }
 
 

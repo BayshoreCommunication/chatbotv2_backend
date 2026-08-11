@@ -1,9 +1,9 @@
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
 class ThemeSettings(BaseModel):
-    primary_color: str = "#807045"
+    primary_color: str = "#474747"
     font_family: str = "Inter"
 
 
@@ -28,11 +28,12 @@ class LauncherSettings(BaseModel):
 
 
 class WidgetSettingsModel(BaseModel):
-    bot_name: str = "BayAI Assistant"
+    bot_name: str = "Go Converto"
     theme: ThemeSettings = Field(default_factory=ThemeSettings)
     behavior: BehaviorSettings = Field(default_factory=BehaviorSettings)
     content: ContentSettings = Field(default_factory=ContentSettings)
     launcher: LauncherSettings = Field(default_factory=LauncherSettings)
+    embed_type: Literal["custom", "wordpress"] = "custom"
 
 
 class WidgetSettingsResponse(WidgetSettingsModel):
