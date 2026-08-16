@@ -135,6 +135,13 @@ class SubscriptionModel(BaseModel):
     ended_at: Optional[datetime] = Field(
         None, description="When the subscription actually ended after cancel_at_period_end."
     )
+    ending_reminder_sent_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "Set once the ~1-day-before-period-end reminder email has been sent, so the "
+            "background reminder loop never emails the same cancellation twice."
+        ),
+    )
     collection_method: Literal["charge_automatically", "send_invoice"] = Field(
         "charge_automatically",
         description=(

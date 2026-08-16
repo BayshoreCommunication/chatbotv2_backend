@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -27,6 +28,7 @@ from routers import (
 )
 from routers.chat_router import widget_router
 from services.admin.admin_auth import seed_super_admin
+from services.subscription.subscription_service import send_ending_soon_reminders
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -42,12 +44,31 @@ logging.getLogger("pinecone").setLevel(logging.WARNING)
 logging.getLogger("langchain").setLevel(logging.WARNING)
 logging.getLogger("watchfiles").setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
+
+
+# How often to check for canceled subscriptions entering their "ends
+# tomorrow" reminder window. No Stripe webhook fires for this (unlike trial
+# endings), so this is the only thing driving that email.
+SUBSCRIPTION_REMINDER_INTERVAL_SECONDS = 60 * 60
+
+
+async def _subscription_reminder_loop() -> None:
+    while True:
+        try:
+            await send_ending_soon_reminders(get_database())
+        except Exception:
+            logger.exception("subscription_reminder_loop.failed")
+        await asyncio.sleep(SUBSCRIPTION_REMINDER_INTERVAL_SECONDS)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await seed_super_admin(get_database())
+    reminder_task = asyncio.create_task(_subscription_reminder_loop())
     yield
+    reminder_task.cancel()
     await close_mongo_connection()
 
 

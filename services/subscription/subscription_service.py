@@ -7,7 +7,7 @@ All Stripe + MongoDB subscription business logic.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import stripe
@@ -17,6 +17,17 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from config import settings
 from model.subscription_model import CONVERSATION_LIMITS
 from services import notification_service
+from utils.email import (
+    send_subscription_confirmed_email,
+    send_subscription_ended_email,
+    send_subscription_ending_soon_email,
+)
+
+# How far ahead of a canceled subscription's period end to send the
+# "ends tomorrow" warning email. The reminder loop (see
+# send_ending_soon_reminders) runs hourly, so this just needs to be wide
+# enough that no run misses a subscription — not an exact 24h boundary.
+ENDING_SOON_REMINDER_WINDOW = timedelta(hours=24)
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +107,20 @@ def _to_object_id(company_id: str):
         return ObjectId(company_id)
     except Exception:
         return company_id
+
+
+async def _get_company_contact(
+    db: AsyncIOMotorDatabase, company_id: str,
+) -> tuple[str | None, str | None]:
+    """Returns (email, company_name) for a company — used by every
+    subscription lifecycle email so there's one place that knows where that
+    info lives."""
+    user = await db["users"].find_one(
+        {"_id": _to_object_id(company_id)}, {"email": 1, "company_name": 1},
+    )
+    if not user:
+        return None, None
+    return user.get("email"), user.get("company_name")
 
 
 def _read_metadata(obj: Any) -> dict:
@@ -693,6 +718,21 @@ async def _on_checkout_completed(db: AsyncIOMotorDatabase, session: Any) -> None
                 result.matched_count, result.upserted_id)
 
     await _sync_users_doc(db, company_id, sub_status, tier, period_end, period_start)
+
+    # Best-effort — a failed confirmation email shouldn't fail the webhook
+    # and trigger a Stripe retry that re-runs the whole handler.
+    email, company_name = await _get_company_contact(db, company_id)
+    if email:
+        try:
+            await send_subscription_confirmed_email(
+                email, company_name or "there", tier, billing_cycle,
+                amount_total, currency, period_end,
+            )
+        except Exception:
+            logger.warning(
+                "checkout.completed.confirmation_email_failed company_id=%s", company_id, exc_info=True,
+            )
+
     logger.info("checkout.completed.done company_id=%s", company_id)
 
 
@@ -767,6 +807,14 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         await notification_service.create_subscription_ending_notification(
             db, company_id, doc.get("current_period_end"),
         )
+    elif was_ending and not now_ending:
+        # Customer un-canceled — clear the "ends tomorrow" flag so a future
+        # cancellation gets its own fresh reminder email instead of being
+        # silently skipped as "already sent".
+        await db["subscriptions"].update_one(
+            {"company_id": company_id},
+            {"$set": {"ending_reminder_sent_at": None}},
+        )
 
     logger.info("subscription.upsert.done company_id=%s", company_id)
 
@@ -807,6 +855,18 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
         }},
     )
     await notification_service.create_subscription_canceled_notification(db, company_id)
+
+    # Best-effort — same reasoning as the confirmation email: don't let a
+    # Resend hiccup turn into a Stripe webhook retry of the whole handler.
+    email, company_name = await _get_company_contact(db, company_id)
+    if email:
+        try:
+            await send_subscription_ended_email(email, company_name or "there")
+        except Exception:
+            logger.warning(
+                "subscription.deleted.ended_email_failed company_id=%s", company_id, exc_info=True,
+            )
+
     logger.info("subscription.deleted.done company_id=%s", company_id)
 
 
@@ -881,3 +941,55 @@ async def _on_payment_failed(db: AsyncIOMotorDatabase, invoice: Any) -> None:
     await _sync_users_doc(db, company_id, "past_due", tier, existing.get("current_period_end"))
     await notification_service.create_payment_failed_notification(db, company_id)
     logger.info("payment.failed.done company_id=%s", company_id)
+
+
+# ── Scheduled reminder: "ends tomorrow" email ────────────────────────────────
+# Unlike every handler above, this isn't triggered by a Stripe webhook —
+# Stripe only warns ahead of time for trials (trial_will_end, handled above),
+# never for a plain cancel-at-period-end. A background loop (see main.py)
+# calls this on an interval to catch subscriptions as they enter the
+# reminder window.
+
+async def send_ending_soon_reminders(db: AsyncIOMotorDatabase) -> None:
+    """Emails every canceled-but-still-active subscription whose access ends
+    within ENDING_SOON_REMINDER_WINDOW and hasn't been reminded yet.
+
+    Claims each subscription with an atomic update (filtered on
+    ending_reminder_sent_at being unset) before emailing it, so running this
+    from multiple workers/instances — or on overlapping intervals — can
+    never send the same reminder twice.
+    """
+    now = datetime.now(timezone.utc)
+    window_end = now + ENDING_SOON_REMINDER_WINDOW
+
+    cursor = db["subscriptions"].find({
+        "cancel_at_period_end": True,
+        "subscription_status": {"$in": ["active", "trialing"]},
+        "current_period_end": {"$gte": now, "$lte": window_end},
+        "ending_reminder_sent_at": None,
+    })
+
+    async for doc in cursor:
+        company_id = doc["company_id"]
+
+        claimed = await db["subscriptions"].find_one_and_update(
+            {"_id": doc["_id"], "ending_reminder_sent_at": None},
+            {"$set": {"ending_reminder_sent_at": now}},
+        )
+        if not claimed:
+            continue  # another worker/run already claimed this one
+
+        email, company_name = await _get_company_contact(db, company_id)
+        if not email:
+            logger.warning("subscription.ending_reminder.no_email company_id=%s", company_id)
+            continue
+
+        try:
+            await send_subscription_ending_soon_email(
+                email, company_name or "there", doc.get("current_period_end"),
+            )
+            logger.info("subscription.ending_reminder.sent company_id=%s", company_id)
+        except Exception:
+            logger.warning(
+                "subscription.ending_reminder.send_failed company_id=%s", company_id, exc_info=True,
+            )
