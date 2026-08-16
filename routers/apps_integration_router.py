@@ -66,6 +66,7 @@ from services.apps_integration import (
     test_messenger_connection,
     verify_meta_webhook_signature,
 )
+from services.subscription.subscription_service import get_subscription
 
 from model.apps_integration_model import (
     ChannelConnectionsListResponse,
@@ -136,13 +137,39 @@ async def get_current_user(
     return {"id": str(user["_id"])}
 
 
+# Apps Integration (Messenger/Instagram/WhatsApp) is an Advanced-plan feature
+# per the pricing page — every dashboard-facing endpoint below requires it.
+# The public Meta-facing endpoints (webhook, oauth/callback) are deliberately
+# NOT behind this gate: Meta calls those directly with no Authorization
+# header to check a tier against, and callback only hands back a selection_id
+# — confirm_channel_oauth_selection (gated) is what actually saves a
+# connection, so an ungated callback grants nothing by itself.
+_ADVANCED_TIERS = {"advanced", "enterprise"}
+_ACTIVE_STATUSES = {"active", "trialing"}
+
+
+async def require_advanced_subscription(
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    current_user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    sub = await get_subscription(db, current_user["id"])
+    tier = sub.get("subscription_tier") if sub else None
+    sub_status = sub.get("subscription_status") if sub else None
+    if tier not in _ADVANCED_TIERS or sub_status not in _ACTIVE_STATUSES:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            detail="Apps Integration is available on the Advanced plan — upgrade to connect Messenger, Instagram, or WhatsApp.",
+        )
+    return current_user
+
+
 # ── Messenger: dashboard-facing settings ──────────────────────────────────────
 
 
 @router.get("/messenger/snapshot", response_model=MessengerSettingsResponse)
 async def get_messenger_snapshot(
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     company_settings = await get_company_messenger_settings(db, current_user["id"])
     connected = bool(company_settings.access_token and company_settings.page_id)
@@ -153,7 +180,7 @@ async def get_messenger_snapshot(
 async def connect_messenger(
     payload: MessengerConnectRequest,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     valid, page_name = await test_messenger_connection(
         payload.page_id, payload.access_token
@@ -178,7 +205,7 @@ async def connect_messenger(
 async def connect_messenger_via_login_for_business(
     payload: MessengerEmbeddedConnectRequest,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     try:
         company_settings = await connect_messenger_embedded(
@@ -196,7 +223,7 @@ async def connect_messenger_via_login_for_business(
 @router.delete("/messenger/settings")
 async def disconnect_messenger(
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     await delete_company_messenger_settings(db, current_user["id"])
     return {"ok": True}
@@ -270,7 +297,7 @@ async def receive_messenger_webhook(
 
 @router.get("/oauth/initiate", response_model=OAuthInitiateResponse)
 async def initiate_channel_oauth(
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     return OAuthInitiateResponse(authorize_url=build_authorize_url(current_user["id"]))
 
@@ -306,7 +333,7 @@ async def channel_oauth_callback(
 async def get_channel_oauth_pending_selection(
     selection_id: str,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     try:
         pages = await get_pending_selection(db, current_user["id"], selection_id)
@@ -320,7 +347,7 @@ async def get_channel_oauth_pending_selection(
 async def confirm_channel_oauth_selection(
     payload: OAuthConfirmRequest,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     try:
         saved = await confirm_channel_connections(
@@ -343,7 +370,7 @@ async def confirm_channel_oauth_selection(
 @router.get("/oauth/connections", response_model=ChannelConnectionsListResponse)
 async def list_channel_connections(
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     connections = await list_company_channel_connections(db, current_user["id"])
     return ChannelConnectionsListResponse(
@@ -362,7 +389,7 @@ async def disconnect_channel_oauth_connection(
     channel: ChannelType,
     external_id: str,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     found = await disconnect_channel_connection(db, current_user["id"], channel, external_id)
     if not found:
@@ -381,7 +408,7 @@ async def disconnect_channel_oauth_connection(
 async def connect_whatsapp_via_embedded_signup(
     payload: WhatsAppEmbeddedConnectRequest,
     db: AsyncIOMotorDatabase = Depends(get_database),
-    current_user: dict[str, Any] = Depends(get_current_user),
+    current_user: dict[str, Any] = Depends(require_advanced_subscription),
 ):
     try:
         connection = await connect_whatsapp_embedded(
