@@ -297,3 +297,35 @@ async def send_subscription_ended_email(to_email: str, company_name: str) -> Non
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
+async def send_visitor_limit_reached_email(to_email: str, company_name: str) -> None:
+    """Sent the first time a billing period's visitor cap is hit — once per
+    period, not on every blocked visitor."""
+
+    subject = "You've reached your visitor limit"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">Visitor limit reached</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, your AI assistant has used up all the visitors included in your plan for this billing period.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">New visitors won't get AI replies until you upgrade your plan or your next billing period starts. Existing conversations already in progress aren't affected.</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">You can upgrade anytime from your billing settings to raise this limit immediately.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")

@@ -139,6 +139,22 @@ async def create_payment_failed_notification(
     )
 
 
+async def create_visitor_limit_reached_notification(
+    db: AsyncIOMotorDatabase, company_id: str,
+) -> None:
+    """Insert a notification the first time a billing period's visitor cap is
+    hit — fired once per period by check_and_count_visitor, not on every
+    subsequent blocked visitor."""
+    await _insert(
+        db, company_id, "visitor_limit_reached",
+        title="Visitor limit reached",
+        message=(
+            "You've used all the visitors included in your plan for this billing period. "
+            "New visitors won't get AI replies until you upgrade or your next period starts."
+        ),
+    )
+
+
 async def create_trial_ending_notification(
     db: AsyncIOMotorDatabase,
     company_id: str,

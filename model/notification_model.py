@@ -23,6 +23,7 @@ NotificationType = Literal[
     "subscription_canceled",
     "payment_failed",
     "trial_ending",
+    "visitor_limit_reached",
 ]
 
 

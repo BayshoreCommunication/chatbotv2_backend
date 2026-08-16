@@ -43,14 +43,19 @@ SubscriptionStatus = Literal[
 BillingCycle = Literal["monthly", "annual"]
 
 
-# ── Conversation limits per plan ──────────────────────────────────────────────
-# `None` means unlimited. The "free" tier's allotment is a one-time grant per
-# company (tracked via `free_trial_used`) — it is not renewed automatically.
+# ── Visitor limits per plan ────────────────────────────────────────────────────
+# `None` means unlimited. Counts unique visitors per billing period (one count
+# per new visitor's first message — not per message, not per plan), shared
+# across every channel: website widget, Messenger, Instagram, WhatsApp. The
+# "free" tier's allotment is a one-time grant per company (tracked via
+# `free_trial_used`) — it is not renewed automatically. While trialing
+# Professional/Advanced, the trialed plan's own limit applies — no separate
+# trial-specific number.
 
 CONVERSATION_LIMITS: dict[SubscriptionTier, Optional[int]] = {
     "free":         1000,
-    "professional": 5000,
-    "advanced":     None,   # unlimited
+    "professional": 1000,
+    "advanced":     2500,
     "enterprise":   None,   # unlimited (custom contract may override manually)
 }
 
@@ -116,11 +121,23 @@ class SubscriptionModel(BaseModel):
     )
     conversations_used: int = Field(
         0, ge=0,
-        description="Conversations consumed so far (free tier: one-time lifetime total; paid tiers: current period).",
+        description=(
+            "Unique visitors counted so far this period (free tier: one-time lifetime "
+            "total; paid tiers: current billing period — reset on renewal or plan change). "
+            "Incremented via services.subscription.subscription_service.check_and_count_visitor."
+        ),
     )
     free_trial_used: bool = Field(
         False,
         description="True once this company has consumed its one-time free-tier conversation allotment.",
+    )
+    limit_reached_notified_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "Set the first time a new visitor is blocked for exceeding conversation_limit "
+            "this period, so the 'visitor limit reached' email/notification fires once per "
+            "period instead of on every subsequent blocked visitor. Cleared on usage reset."
+        ),
     )
 
     # ── Status ────────────────────────────────────────────────────────────────

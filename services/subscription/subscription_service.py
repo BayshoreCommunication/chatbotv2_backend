@@ -21,7 +21,10 @@ from utils.email import (
     send_subscription_confirmed_email,
     send_subscription_ended_email,
     send_subscription_ending_soon_email,
+    send_visitor_limit_reached_email,
 )
+
+VISITOR_COUNTS_COLLECTION = "subscription_visitor_counts"
 
 # How far ahead of a canceled subscription's period end to send the
 # "ends tomorrow" warning email. The reminder loop (see
@@ -121,6 +124,105 @@ async def _get_company_contact(
     if not user:
         return None, None
     return user.get("email"), user.get("company_name")
+
+
+# ── Visitor limit gate ───────────────────────────────────────────────────────
+# Shared across every channel — routers/chat_router.py's chat() is the single
+# endpoint all of them funnel through (the widget calls it directly; Messenger/
+# Instagram/WhatsApp reach it via services.apps_integration's get_ai_reply, which
+# posts to this same /chat/{company_id} route) — so gating there covers all four
+# without duplicating this logic per channel.
+
+async def _reset_usage_for_company(db: AsyncIOMotorDatabase, company_id: str) -> None:
+    """Fresh start for a new billing period or a plan change: zero the visitor
+    counter, clear the 'limit reached' flag so a future cap-out notifies
+    again, and forget every visitor counted so far so returning visitors
+    count as new again next period."""
+    await db["subscriptions"].update_one(
+        {"company_id": company_id},
+        {"$set": {"conversations_used": 0, "limit_reached_notified_at": None}},
+    )
+    await db[VISITOR_COUNTS_COLLECTION].delete_many({"company_id": company_id})
+
+
+async def _notify_visitor_limit_reached(db: AsyncIOMotorDatabase, company_id: str) -> None:
+    """Best-effort — fires exactly once per billing period (claimed atomically
+    via limit_reached_notified_at); every subsequent blocked visitor in the
+    same period is a no-op here."""
+    claimed = await db["subscriptions"].find_one_and_update(
+        {"company_id": company_id, "limit_reached_notified_at": None},
+        {"$set": {"limit_reached_notified_at": datetime.now(timezone.utc)}},
+    )
+    if not claimed:
+        return
+
+    await notification_service.create_visitor_limit_reached_notification(db, company_id)
+
+    email, company_name = await _get_company_contact(db, company_id)
+    if email:
+        try:
+            await send_visitor_limit_reached_email(email, company_name or "there")
+        except Exception:
+            logger.warning(
+                "subscription.visitor_limit.email_failed company_id=%s", company_id, exc_info=True,
+            )
+
+
+async def check_and_count_visitor(
+    db: AsyncIOMotorDatabase, company_id: str, channel: str, visitor_key: str,
+) -> bool:
+    """Gate + counter for the visitor cap, called once per inbound message
+    from chat_router.chat() before it invokes the AI agent.
+
+    Returns True if this visitor may get an AI reply — either they were
+    already counted this billing period (continuing an existing conversation,
+    so every later message from them is free), or they're brand new and the
+    company is still under its plan's visitor_limit (counted here, for the
+    first time).
+
+    Returns False only for a brand-new visitor once the cap has already been
+    reached that period — the caller should show a generic fallback message
+    instead of routing to the AI. Never raises: a Mongo hiccup fails open
+    (True) so an outage never blocks real customers from chatting.
+    """
+    key = f"{company_id}:{channel}:{visitor_key}"
+    try:
+        already_counted = await db[VISITOR_COUNTS_COLLECTION].find_one({"_id": key}, {"_id": 1})
+        if already_counted:
+            return True
+
+        sub = await db["subscriptions"].find_one(
+            {"company_id": company_id}, {"conversation_limit": 1, "conversations_used": 1},
+        )
+        limit = sub.get("conversation_limit") if sub else CONVERSATION_LIMITS["free"]
+        used  = sub.get("conversations_used", 0) if sub else 0
+
+        if limit is not None and used >= limit:
+            await _notify_visitor_limit_reached(db, company_id)
+            return False
+
+        # Atomic claim — only the caller whose update actually inserts this
+        # key also gets to increment the counter, so concurrent first
+        # messages from different visitors can't double-count one visitor.
+        result = await db[VISITOR_COUNTS_COLLECTION].update_one(
+            {"_id": key},
+            {"$setOnInsert": {
+                "company_id": company_id, "channel": channel,
+                "counted_at": datetime.now(timezone.utc),
+            }},
+            upsert=True,
+        )
+        if result.upserted_id is not None:
+            await db["subscriptions"].update_one(
+                {"company_id": company_id}, {"$inc": {"conversations_used": 1}},
+            )
+        return True
+    except Exception:
+        logger.warning(
+            "subscription.visitor_gate.check_failed company_id=%s channel=%s",
+            company_id, channel, exc_info=True,
+        )
+        return True
 
 
 def _read_metadata(obj: Any) -> dict:
@@ -717,6 +819,12 @@ async def _on_checkout_completed(db: AsyncIOMotorDatabase, session: Any) -> None
     logger.info("checkout.completed.subscriptions_write matched=%s upserted_id=%s",
                 result.matched_count, result.upserted_id)
 
+    # A brand-new company doc is already at 0 via $setOnInsert above, but a
+    # company re-subscribing after a cancellation would otherwise keep its
+    # stale usage from before — always start a freshly-confirmed subscription
+    # with a clean visitor count.
+    await _reset_usage_for_company(db, company_id)
+
     await _sync_users_doc(db, company_id, sub_status, tier, period_end, period_start)
 
     # Best-effort — a failed confirmation email shouldn't fail the webhook
@@ -784,6 +892,13 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         upsert=True,
     )
     logger.info("subscription.upsert.db_write matched=%s upserted_id=%s", result.matched_count, result.upserted_id)
+
+    # A genuine plan change (change_subscription_plan's upgrade/downgrade,
+    # synced here rather than written directly there) gets a clean visitor
+    # count immediately — don't make someone who just upgraded wait for next
+    # month because they were already capped out on the old plan.
+    if existing_tier and existing_tier != tier:
+        await _reset_usage_for_company(db, company_id)
 
     sub_status = getattr(sub, "status", "active")
     # A trialing subscription keeps a pending_setup_intent until the customer
@@ -897,6 +1012,12 @@ async def _on_payment_succeeded(db: AsyncIOMotorDatabase, invoice: Any) -> None:
     )
     tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "active", tier, period_end, period_start)
+
+    # New billing period (or the subscription's very first invoice, where
+    # usage is already 0) — either way, a fresh period starts with a clean
+    # visitor count.
+    await _reset_usage_for_company(db, company_id)
+
     logger.info("payment.succeeded.done company_id=%s period_end=%s", company_id, period_end)
 
 

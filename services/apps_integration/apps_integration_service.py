@@ -172,7 +172,7 @@ async def get_ai_reply(
     async with httpx.AsyncClient(timeout=60.0) as client:
         resp = await client.post(
             f"{settings.INTERNAL_API_BASE_URL}/api/v1/chat/{company_id}",
-            json={"session_id": session_id, "message": message},
+            json={"session_id": session_id, "message": message, "channel": channel},
         )
     if resp.status_code >= 400:
         logger.error(

@@ -37,6 +37,7 @@ from services.chatbot.session_cache import (
 )
 from services.chatbot.tools import build_tools
 from services.chatbot.ws_manager import ws_manager
+from services.subscription.subscription_service import check_and_count_visitor
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
 widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
@@ -184,6 +185,11 @@ class ChatRequest(BaseModel):
     visitor_id: str | None = None
     message: str
     user_timezone: str | None = None
+    # Which channel this message came in on — "widget" (default, the public
+    # website chat) or "messenger"/"instagram"/"whatsapp" (set by
+    # services.apps_integration's get_ai_reply, which posts here too). Used
+    # only to scope the visitor-limit counter per channel.
+    channel: str = "widget"
 
 
 class ChatResponse(BaseModel):
@@ -290,6 +296,30 @@ async def chat(company_id: str, payload: ChatRequest):
         company_id, ctx["company_name"], ctx["is_trained"],
         ctx["entries_stored"], elapsed_ctx,
     )
+
+    # ── Visitor limit gate — shared across widget/Messenger/Instagram/WhatsApp ─
+    # Checked before the (expensive) agent build/invoke below. visitor_id is
+    # the widget's persistent per-browser ID when present; every channel that
+    # lacks one (and Messenger/Instagram/WhatsApp, which never send one) falls
+    # back to session_id, which for those channels is already the platform's
+    # own stable per-visitor ID (PSID/IGSID/wa_id). channel="test" is the
+    # dashboard's own "test your bot" preview (Train AI) — never gated or
+    # counted, since that's the owner testing, not a real visitor.
+    visitor_key = (payload.visitor_id or payload.session_id).strip()
+    allowed = payload.channel == "test" or await check_and_count_visitor(
+        get_database(), company_id, payload.channel, visitor_key,
+    )
+    if not allowed:
+        logger.info(
+            "chat.request.blocked_visitor_limit company_id=%s channel=%s session_id=%s",
+            company_id, payload.channel, payload.session_id,
+        )
+        return ChatResponse(
+            reply="We're facing some technical issues right now — please try again a bit later.",
+            session_id=payload.session_id,
+            company_id=company_id,
+            tools_used=[],
+        )
 
     # ── Get (or build + cache) the agent for this company ────────────────────
     t_agent = time.monotonic()
