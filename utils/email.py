@@ -299,6 +299,67 @@ async def send_subscription_ended_email(to_email: str, company_name: str) -> Non
             raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
 
 
+async def send_plan_changed_email(
+    to_email: str,
+    company_name: str,
+    tier: str,
+    billing_cycle: str,
+    amount_charged: float | None,
+    currency: str,
+    scheduled: bool,
+    effective_at: datetime | None,
+) -> None:
+    """
+    Sent from change_subscription_plan right after a plan switch completes —
+    either charged immediately (upgrade / trial ending into a paid plan /
+    same-price switch) or scheduled for the next renewal with no charge
+    (downgrade). Only called once the outcome is definitively known (i.e.
+    not while a payment confirmation is still pending on the frontend).
+    """
+    plan_label = f"{tier.title()} ({billing_cycle})"
+
+    if scheduled:
+        subject = f"Switching to {tier.title()} at your next renewal"
+        when = effective_at.strftime("%B %d, %Y") if effective_at else "your next renewal date"
+        body_line = (
+            f"Your plan will switch to <strong>{plan_label}</strong> on <strong>{when}</strong>. "
+            "You'll keep your current plan's features until then — no charge today, "
+            "and no refund for the current period."
+        )
+    else:
+        amount_str = f"${amount_charged:,.2f} {currency.upper()}" if amount_charged else "$0.00"
+        subject = f"You're now on {tier.title()}"
+        body_line = (
+            f"You've switched to <strong>{plan_label}</strong> and <strong>{amount_str}</strong> "
+            "was charged to your card on file just now."
+        )
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">Plan changed</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, this confirms your plan change.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">{body_line}</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">Questions about your billing? Reach us at info@goconverto.com.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
 async def send_cancellation_received_email(
     to_email: str, company_name: str, access_until: datetime | None, immediately: bool,
 ) -> None:

@@ -23,6 +23,7 @@ from utils.email import (
     send_chatbot_overdue_email,
     send_payment_due_email,
     send_payment_hard_reminder_email,
+    send_plan_changed_email,
     send_subscription_confirmed_email,
     send_subscription_ended_email,
     send_subscription_ending_soon_email,
@@ -129,6 +130,37 @@ async def _get_company_contact(
     if not user:
         return None, None
     return user.get("email"), user.get("company_name")
+
+
+async def _notify_plan_changed(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    tier: str,
+    billing_cycle: str,
+    amount_charged: float | None,
+    currency: str,
+    scheduled: bool,
+    effective_at: datetime | None,
+) -> None:
+    """
+    Best-effort — same reasoning as every other lifecycle email here: don't
+    let a Resend hiccup fail the plan-change call itself. Only call this once
+    the outcome is definitively known (already-charged or genuinely
+    scheduled) — never while a payment confirmation is still pending on the
+    frontend, since the switch hasn't actually happened yet at that point.
+    """
+    email, company_name = await _get_company_contact(db, company_id)
+    if not email:
+        return
+    try:
+        await send_plan_changed_email(
+            email, company_name or "there", tier, billing_cycle,
+            amount_charged, currency, scheduled, effective_at,
+        )
+    except Exception:
+        logger.warning(
+            "subscription.change_plan.email_failed company_id=%s", company_id, exc_info=True,
+        )
 
 
 # ── Visitor limit gate ───────────────────────────────────────────────────────
@@ -711,6 +743,14 @@ async def change_subscription_plan(
                 "requires_payment=%s intent_kind=%s",
                 company_id, tier, billing_cycle, sub_id, requires_payment, intent_kind,
             )
+            if not requires_payment:
+                paid_invoice = updated.latest_invoice
+                await _notify_plan_changed(
+                    db, company_id, tier, billing_cycle,
+                    (getattr(paid_invoice, "amount_paid", 0) or 0) / 100,
+                    getattr(paid_invoice, "currency", "usd") or "usd",
+                    scheduled=False, effective_at=None,
+                )
             return {
                 "ok": True,
                 "requires_payment": requires_payment,
@@ -754,6 +794,13 @@ async def change_subscription_plan(
                 "diff=%s requires_payment=%s intent_kind=%s",
                 company_id, tier, billing_cycle, sub_id, new_amount - current_amount, requires_payment, intent_kind,
             )
+            if not requires_payment:
+                await _notify_plan_changed(
+                    db, company_id, tier, billing_cycle,
+                    (getattr(invoice, "amount_paid", 0) or 0) / 100,
+                    getattr(invoice, "currency", "usd") or "usd",
+                    scheduled=False, effective_at=None,
+                )
             return {
                 "ok": True,
                 "requires_payment": requires_payment,
@@ -808,6 +855,11 @@ async def change_subscription_plan(
                 "schedule_id=%s effective_at=%s",
                 company_id, tier, billing_cycle, sub_id, schedule.id, period_end,
             )
+            await _notify_plan_changed(
+                db, company_id, tier, billing_cycle, None,
+                getattr(sub, "currency", "usd") or "usd",
+                scheduled=True, effective_at=period_end,
+            )
             return {"ok": True, "requires_payment": False, "client_secret": None, "intent_kind": None}
 
         # ── Same price — plain immediate switch, unchanged from before ─────
@@ -828,6 +880,14 @@ async def change_subscription_plan(
             "requires_payment=%s intent_kind=%s",
             company_id, tier, billing_cycle, sub_id, requires_payment, intent_kind,
         )
+        if not requires_payment:
+            paid_invoice = updated.latest_invoice
+            await _notify_plan_changed(
+                db, company_id, tier, billing_cycle,
+                (getattr(paid_invoice, "amount_paid", 0) or 0) / 100,
+                getattr(paid_invoice, "currency", "usd") or "usd",
+                scheduled=False, effective_at=None,
+            )
         # The customer.subscription.updated webhook will fire next and sync
         # the new tier/price/period into MongoDB — no manual write needed here
         # (except the downgrade branch above, which tracks the pending switch
