@@ -28,7 +28,10 @@ from routers import (
 )
 from routers.chat_router import widget_router
 from services.admin.admin_auth import seed_super_admin
-from services.subscription.subscription_service import send_ending_soon_reminders
+from services.subscription.subscription_service import (
+    process_overdue_subscriptions,
+    send_ending_soon_reminders,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -52,6 +55,11 @@ logger = logging.getLogger(__name__)
 # endings), so this is the only thing driving that email.
 SUBSCRIPTION_REMINDER_INTERVAL_SECONDS = 60 * 60
 
+# How often to check past_due subscriptions for the day-3 hard reminder and
+# day-7 overdue cutoff. Neither is a Stripe webhook event, so this loop is
+# what actually drives the grace-period clock.
+OVERDUE_CHECK_INTERVAL_SECONDS = 60 * 60
+
 
 async def _subscription_reminder_loop() -> None:
     while True:
@@ -62,13 +70,24 @@ async def _subscription_reminder_loop() -> None:
         await asyncio.sleep(SUBSCRIPTION_REMINDER_INTERVAL_SECONDS)
 
 
+async def _overdue_check_loop() -> None:
+    while True:
+        try:
+            await process_overdue_subscriptions(get_database())
+        except Exception:
+            logger.exception("overdue_check_loop.failed")
+        await asyncio.sleep(OVERDUE_CHECK_INTERVAL_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await seed_super_admin(get_database())
     reminder_task = asyncio.create_task(_subscription_reminder_loop())
+    overdue_task  = asyncio.create_task(_overdue_check_loop())
     yield
     reminder_task.cancel()
+    overdue_task.cancel()
     await close_mongo_connection()
 
 

@@ -36,8 +36,33 @@ def _tier_from_invoice(invoice: Any) -> str | None:
         line_data = getattr(lines, "data", []) if lines else []
         if not line_data:
             return None
-        price = getattr(line_data[0], "price", None)
-        price_id = getattr(price, "id", None)
+        line = line_data[0]
+
+        # Most direct signal when present: change_subscription_plan tags its
+        # invoices/subscription items with metadata={"tier": ..., ...}, which
+        # Stripe carries onto the resulting invoice line item's own metadata.
+        # Note: .get() on a StripeObject (unlike a plain dict) raises
+        # AttributeError in this SDK version — use "in"/bracket access instead,
+        # same as the existing _read_metadata() helper in subscription_service.
+        line_metadata = getattr(line, "metadata", None)
+        if line_metadata and "tier" in line_metadata and line_metadata["tier"]:
+            return line_metadata["tier"]
+
+        # Stripe's "Basil" API version (2025-03-31+) moved the line item's
+        # price reference from a top-level `price` field to
+        # `pricing.price_details.price` (the old field is always None/absent
+        # now) — check both so this works regardless of API version. Without
+        # this, every invoice's tier lookup silently returns None and the
+        # frontend mislabels every historical invoice with the company's
+        # *current* tier instead of whatever it actually was at the time.
+        pricing = getattr(line, "pricing", None)
+        price_details = getattr(pricing, "price_details", None) if pricing else None
+        price_id = getattr(price_details, "price", None) if price_details else None
+
+        if not price_id:
+            price = getattr(line, "price", None)
+            price_id = getattr(price, "id", None) if price else None
+
         return _PRICE_ID_TO_TIER.get(price_id)
     except Exception:
         return None
@@ -111,6 +136,49 @@ async def _ensure_default_payment_method(
     return promoted_id
 
 
+def _dedupe_payment_methods(methods: list[Any], default_id: str | None) -> list[Any]:
+    """
+    Stripe doesn't dedupe payment methods by card — re-submitting the exact
+    same physical card (e.g. re-testing card 4242 4242 4242 4242, or a
+    customer re-entering their own card instead of picking the saved one)
+    attaches a second, third, ... distinct PaymentMethod object that looks
+    identical in the UI. Groups by the card's `fingerprint` (Stripe's stable
+    identifier for "this is physically the same card") and detaches every
+    duplicate but one, keeping the current default if it's among the
+    duplicates, else the most recently created one.
+    """
+    by_fingerprint: dict[str, list[Any]] = {}
+    for pm in methods:
+        fingerprint = getattr(getattr(pm, "card", None), "fingerprint", None) or pm.id
+        by_fingerprint.setdefault(fingerprint, []).append(pm)
+
+    kept: list[Any] = []
+    for fingerprint, group in by_fingerprint.items():
+        if len(group) == 1:
+            kept.append(group[0])
+            continue
+
+        group.sort(key=lambda pm: getattr(pm, "created", 0), reverse=True)
+        keep = next((pm for pm in group if pm.id == default_id), group[0])
+        kept.append(keep)
+        for pm in group:
+            if pm.id == keep.id:
+                continue
+            try:
+                stripe.PaymentMethod.detach(pm.id)
+                logger.info(
+                    "billing.payment_methods.duplicate_detached payment_method_id=%s "
+                    "fingerprint=%s kept=%s",
+                    pm.id, fingerprint, keep.id,
+                )
+            except stripe.StripeError:
+                logger.warning(
+                    "billing.payment_methods.duplicate_detach_failed payment_method_id=%s",
+                    pm.id, exc_info=True,
+                )
+    return kept
+
+
 async def list_payment_methods(db: AsyncIOMotorDatabase, company_id: str) -> dict:
     stripe.api_key = settings.STRIPE_SECRET_KEY
     customer_id = await _get_customer_id(db, company_id)
@@ -123,7 +191,8 @@ async def list_payment_methods(db: AsyncIOMotorDatabase, company_id: str) -> dic
         default_id = getattr(customer.invoice_settings, "default_payment_method", None)
         methods    = stripe.PaymentMethod.list(customer=customer_id, type="card")
         default_id = await _ensure_default_payment_method(customer_id, default_id, methods.data)
-        cards      = [_serialize_payment_method(pm, default_id) for pm in methods.data]
+        deduped    = _dedupe_payment_methods(methods.data, default_id)
+        cards      = [_serialize_payment_method(pm, default_id) for pm in deduped]
         logger.info("billing.payment_methods.listed company_id=%s count=%s", company_id, len(cards))
         return {"cards": cards}
     except stripe.StripeError as e:

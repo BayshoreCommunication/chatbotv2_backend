@@ -299,6 +299,156 @@ async def send_subscription_ended_email(to_email: str, company_name: str) -> Non
             raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
 
 
+async def send_cancellation_received_email(
+    to_email: str, company_name: str, access_until: datetime | None, immediately: bool,
+) -> None:
+    """Sent synchronously right when cancel_subscription() succeeds — doesn't
+    wait on a Stripe webhook, since immediately=False (the dashboard's
+    default) never fires one that would otherwise confirm this to the
+    customer until right before the period actually ends."""
+
+    if immediately:
+        subject = "Your subscription has been canceled"
+        body_line = "Your subscription has been canceled immediately — you no longer have paid access."
+    elif access_until:
+        subject = "We've received your cancellation"
+        body_line = (
+            f"You'll keep full access until <strong>{access_until.strftime('%B %d, %Y')}</strong>, "
+            "after which your account moves to the free plan. You won't be charged again."
+        )
+    else:
+        subject = "We've received your cancellation"
+        body_line = "Your subscription won't renew. You won't be charged again."
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">Cancellation confirmed</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, this confirms your cancellation request.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">{body_line}</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">Changed your mind? You can resubscribe anytime from your billing settings.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
+async def send_payment_due_email(
+    to_email: str, company_name: str, grace_period_end: datetime | None,
+) -> None:
+    """Sent the moment a charge fails (post-trial or any renewal) — the
+    subscription is now past_due. Grace period is still fully open at this
+    point, but the copy must not imply there's no rush."""
+
+    when = grace_period_end.strftime("%B %d, %Y") if grace_period_end else "in a few days"
+    subject = "Action needed: your payment didn't go through"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">Payment failed</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, we couldn't charge your card for your subscription.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">Please update your payment method by <strong>{when}</strong>. If payment isn't received by then, your chatbot will stop answering your visitors' questions until you pay.</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">You can update your payment method anytime from your billing settings.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
+async def send_payment_hard_reminder_email(
+    to_email: str, company_name: str, grace_period_end: datetime | None,
+) -> None:
+    """Sent ~3 days into the grace period — a stronger-worded follow-up to
+    send_payment_due_email for a still-unpaid past_due subscription."""
+
+    when = grace_period_end.strftime("%B %d, %Y") if grace_period_end else "in a few days"
+    subject = "Final notice: your chatbot will be turned off soon"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #fca5a5;border-radius:8px;">
+        <h2 style="color:#b91c1c;margin-bottom:4px;">Your chatbot will be turned off</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, we still haven't been able to charge your card.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">If payment isn't received by <strong>{when}</strong>, your chatbot will stop answering your visitors' questions. Update your payment method now to avoid any interruption.</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">You can update your payment method anytime from your billing settings.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
+async def send_chatbot_overdue_email(to_email: str, company_name: str) -> None:
+    """Sent once the 7-day grace period lapses with no payment — the
+    chatbot has just been turned off for real."""
+
+    subject = "Your chatbot has been paused"
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">Your chatbot is now paused</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{company_name}</strong>, your subscription is overdue, so your chatbot has stopped answering visitor questions.</p>
+
+        <p style="color:#374151;margin-bottom:8px;">Your dashboard and data are safe and nothing is lost. Pay now from your billing settings to turn your chatbot back on immediately.</p>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">Questions? Reach us at info@goconverto.com.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
 async def send_visitor_limit_reached_email(to_email: str, company_name: str) -> None:
     """Sent the first time a billing period's visitor cap is hit — once per
     period, not on every blocked visitor."""

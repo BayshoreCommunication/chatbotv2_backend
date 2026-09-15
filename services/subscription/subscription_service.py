@@ -15,9 +15,14 @@ from bson import ObjectId
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from config import settings
-from model.subscription_model import CONVERSATION_LIMITS
+from model.subscription_model import CONVERSATION_LIMITS, GRACE_PERIOD_DAYS, HARD_REMINDER_AFTER_DAYS
 from services import notification_service
+from services.chatbot.company_context import invalidate_context
 from utils.email import (
+    send_cancellation_received_email,
+    send_chatbot_overdue_email,
+    send_payment_due_email,
+    send_payment_hard_reminder_email,
     send_subscription_confirmed_email,
     send_subscription_ended_email,
     send_subscription_ending_soon_email,
@@ -225,6 +230,38 @@ async def check_and_count_visitor(
         return True
 
 
+def _extract_payment_confirmation(
+    invoice: Any, fallback_subscription: Any = None,
+) -> tuple[str | None, str, bool]:
+    """
+    Returns (client_secret, intent_kind, requires_payment) for a Stripe
+    invoice. `confirmation_secret` (Stripe's "Basil" API, replacing the old
+    `payment_intent` field) can wrap either a PaymentIntent or a SetupIntent
+    (e.g. a $0-due invoice still needs a payment method saved) — its `type`
+    says which the frontend must confirm against. If the invoice carries no
+    confirmation_secret at all (e.g. ending a trial produced a genuinely $0
+    invoice with nothing to confirm), falls back to `fallback_subscription`'s
+    own `pending_setup_intent`, same as create_subscription_intent's path.
+    """
+    invoice_status = getattr(invoice, "status", None) if invoice else None
+    confirmation_secret = getattr(invoice, "confirmation_secret", None) if invoice else None
+    client_secret = getattr(confirmation_secret, "client_secret", None) if confirmation_secret else None
+    intent_kind = "payment"
+
+    if client_secret:
+        if getattr(confirmation_secret, "type", None) == "setup_intent":
+            intent_kind = "setup"
+    elif fallback_subscription is not None:
+        pending_setup_intent = getattr(fallback_subscription, "pending_setup_intent", None)
+        setup_secret = getattr(pending_setup_intent, "client_secret", None) if pending_setup_intent else None
+        if setup_secret:
+            client_secret = setup_secret
+            intent_kind = "setup"
+
+    requires_payment = bool(client_secret) and invoice_status != "paid"
+    return client_secret, intent_kind, requires_payment
+
+
 def _read_metadata(obj: Any) -> dict:
     """Safely read metadata from a Stripe object into a plain dict."""
     raw = getattr(obj, "metadata", None)
@@ -301,7 +338,11 @@ async def _sync_users_doc(
     period_end: datetime | None,
     period_start: datetime | None = None,
 ) -> None:
-    is_active = status in ("active", "trialing")
+    # "past_due" is included here so the dashboard (which gates on
+    # is_subscribed) stays fully reachable through the whole grace period —
+    # and even after it lapses into "overdue". Only the chat-answering path
+    # ever checks the separate is_overdue flag; the dashboard never does.
+    is_active = status in ("active", "trialing", "past_due")
     # _sync_users_doc is only called when a real Stripe subscription exists
     # (checkout / subscription / invoice webhooks), so any "active" status
     # here means a paid plan — regardless of which tier it's labeled.
@@ -450,13 +491,28 @@ async def create_subscription_intent(
             "metadata":         {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
         }
         trial_already_used = bool((existing or {}).get("free_trial_used", False))
-        if tier in TRIAL_ELIGIBLE_TIERS and not trial_already_used:
+        granting_trial = tier in TRIAL_ELIGIBLE_TIERS and not trial_already_used
+        if granting_trial:
             subscription_kwargs["trial_period_days"] = TRIAL_DAYS
             subscription_kwargs["trial_settings"] = {
                 "end_behavior": {"missing_payment_method": "cancel"},
             }
 
         subscription = stripe.Subscription.create(**subscription_kwargs)
+
+        if granting_trial:
+            # Flip the flag the instant a trial is actually granted, not just
+            # on a later free->paid tier transition (_mark_free_trial_used
+            # below never fires for a company that trials straight into a
+            # paid tier, cancels, and re-subscribes — that loophole let the
+            # same company re-trial indefinitely). Done only after Stripe
+            # confirms the subscription was created, so a failed attempt
+            # doesn't burn the company's trial eligibility.
+            await db["subscriptions"].update_one(
+                {"company_id": company_id},
+                {"$set": {"free_trial_used": True}},
+                upsert=True,
+            )
 
         # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
         # from Invoice objects (to support partial payments) — the
@@ -563,14 +619,24 @@ async def change_subscription_plan(
     price directly via the API instead of creating a new subscription or
     Checkout Session.
 
-    No prorated credit for unused time on the old plan: proration_behavior
-    is "none" and billing_cycle_anchor is reset to "now", so the customer
-    is billed the FULL new-plan price immediately and the next renewal is
-    exactly one cycle from today — switching plans is a fresh payment, not
-    a top-up of the difference.
+    Behavior depends on which way the price is moving (compared live
+    against Stripe, not a hardcoded tier table — this also correctly
+    handles monthly<->annual switches):
+      - Still trialing: nothing's been charged yet, so ends the trial and
+        switches immediately, full new price due now.
+      - Upgrade (new price > current): switches the item immediately with
+        no proration, then charges a flat one-off top-up of exactly
+        (new_price - current_price) — the renewal date is left unchanged.
+      - Downgrade (new price < current): no charge, no refund. A Stripe
+        Subscription Schedule is created so the switch takes effect
+        automatically at the renewal date already paid for.
+      - Same price (e.g. relabeling onto an equivalent variant): plain
+        immediate switch, billing_cycle_anchor reset to "now" — the
+        original behavior, kept as the safe fallback.
 
-    Uses payment_behavior="default_incomplete" so Stripe tells us
-    explicitly what happened instead of us assuming a card is on file:
+    Uses payment_behavior="default_incomplete" (trial-end and same-price
+    branches) so Stripe tells us explicitly what happened instead of us
+    assuming a card is on file:
       - If the customer already has a usable default payment method,
         Stripe charges it immediately and the invoice is already "paid" —
         requires_payment comes back False, nothing more for the frontend
@@ -620,49 +686,209 @@ async def change_subscription_plan(
                     )
             return await create_subscription_intent(db, company_id, tier, billing_cycle)
 
-        item_id = sub["items"]["data"][0]["id"]
+        item_id           = sub["items"]["data"][0]["id"]
+        current_price_id  = sub["items"]["data"][0]["price"]["id"]
+        base_metadata     = {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle}
 
-        # When the sub is still in trial, billing_cycle_anchor="now" is rejected
-        # by Stripe because the anchor can't precede the trial end date.
-        # End the trial immediately so the new plan takes effect right away.
-        modify_kwargs: dict = {
-            "items": [{"id": item_id, "price": price_id}],
-            "proration_behavior": "none",
-            "payment_behavior": "default_incomplete",
-            "expand": ["latest_invoice.confirmation_secret"],
-            "metadata": {"company_id": company_id, "tier": tier, "billing_cycle": billing_cycle},
-        }
+        # Still trialing: nothing's been charged yet this period, so the
+        # upgrade/downgrade split below doesn't apply — end the trial and
+        # switch immediately, same as every plan change used to work.
         if sub.status == "trialing":
-            modify_kwargs["trial_end"] = "now"
-        else:
-            modify_kwargs["billing_cycle_anchor"] = "now"
+            updated = stripe.Subscription.modify(
+                sub_id,
+                items=[{"id": item_id, "price": price_id}],
+                proration_behavior="none",
+                payment_behavior="default_incomplete",
+                trial_end="now",
+                expand=["latest_invoice.confirmation_secret", "pending_setup_intent"],
+                metadata=base_metadata,
+            )
+            client_secret, intent_kind, requires_payment = _extract_payment_confirmation(
+                updated.latest_invoice, fallback_subscription=updated,
+            )
+            logger.info(
+                "subscription.change_plan.ok(trial_end) company_id=%s tier=%s cycle=%s sub_id=%s "
+                "requires_payment=%s intent_kind=%s",
+                company_id, tier, billing_cycle, sub_id, requires_payment, intent_kind,
+            )
+            return {
+                "ok": True,
+                "requires_payment": requires_payment,
+                "client_secret": client_secret if requires_payment else None,
+                "intent_kind": intent_kind if requires_payment else None,
+            }
 
-        updated = stripe.Subscription.modify(sub_id, **modify_kwargs)
+        # Paying customer: compare current vs. target price to decide
+        # upgrade (flat top-up, charged now, renewal date unchanged) vs.
+        # downgrade (no charge, no refund, takes effect at the renewal
+        # already paid for) vs. same price (plain immediate switch — e.g.
+        # relabeling onto an equivalently-priced plan variant).
+        current_amount = stripe.Price.retrieve(current_price_id).unit_amount or 0
+        new_amount     = stripe.Price.retrieve(price_id).unit_amount or 0
 
-        # Stripe's "Basil" API version (2025-03-31+) removed `payment_intent`
-        # from Invoice objects — `confirmation_secret` is the replacement and
-        # gives the client_secret directly. If the invoice already paid
-        # automatically (valid default payment method on file), its status
-        # is "paid" and there's nothing left for the frontend to confirm.
-        latest_invoice = updated.latest_invoice
-        invoice_status = getattr(latest_invoice, "status", None) if latest_invoice else None
-        confirmation_secret = getattr(latest_invoice, "confirmation_secret", None) if latest_invoice else None
-        client_secret = getattr(confirmation_secret, "client_secret", None) if confirmation_secret else None
-        requires_payment = bool(client_secret) and invoice_status != "paid"
+        if new_amount > current_amount:
+            # ── Upgrade: flat top-up ────────────────────────────────────────
+            stripe.Subscription.modify(
+                sub_id,
+                items=[{"id": item_id, "price": price_id}],
+                proration_behavior="none",   # billing_cycle_anchor intentionally
+                metadata=base_metadata,      # left unset — keeps the renewal date.
+            )
+            stripe.InvoiceItem.create(
+                customer=existing["stripe_customer_id"],
+                subscription=sub_id,
+                amount=new_amount - current_amount,
+                currency=getattr(sub, "currency", "usd") or "usd",
+                description=f"Upgrade to {tier.title()}",
+            )
+            invoice = stripe.Invoice.create(
+                customer=existing["stripe_customer_id"],
+                subscription=sub_id,
+                pending_invoice_items_behavior="include",
+            )
+            invoice = stripe.Invoice.finalize_invoice(invoice.id, expand=["confirmation_secret"])
+            client_secret, intent_kind, requires_payment = _extract_payment_confirmation(invoice)
 
+            logger.info(
+                "subscription.change_plan.ok(upgrade) company_id=%s tier=%s cycle=%s sub_id=%s "
+                "diff=%s requires_payment=%s intent_kind=%s",
+                company_id, tier, billing_cycle, sub_id, new_amount - current_amount, requires_payment, intent_kind,
+            )
+            return {
+                "ok": True,
+                "requires_payment": requires_payment,
+                "client_secret": client_secret if requires_payment else None,
+                "intent_kind": intent_kind if requires_payment else None,
+            }
+
+        if new_amount < current_amount:
+            # ── Downgrade: no charge now, switches at renewal ──────────────
+            _, period_end = _period_bounds(sub)
+            if not period_end:
+                logger.error("subscription.change_plan.downgrade_no_period_end company_id=%s sub_id=%s", company_id, sub_id)
+                return {"error": "no_period_end", "detail": "Could not determine renewal date."}
+            period_end_ts = int(period_end.timestamp())
+
+            schedule = stripe.SubscriptionSchedule.create(from_subscription=sub_id)
+            phase0_start = schedule.phases[0]["start_date"]
+            stripe.SubscriptionSchedule.modify(
+                schedule.id,
+                phases=[
+                    {
+                        "items": [{"price": current_price_id, "quantity": 1}],
+                        "start_date": phase0_start,
+                        "end_date": period_end_ts,
+                        "proration_behavior": "none",
+                        "metadata": {
+                            "company_id": company_id,
+                            "tier": existing.get("subscription_tier", ""),
+                            "billing_cycle": existing.get("billing_cycle", "monthly"),
+                        },
+                    },
+                    {
+                        "items": [{"price": price_id, "quantity": 1}],
+                        "start_date": period_end_ts,
+                        "proration_behavior": "none",
+                        "metadata": base_metadata,
+                    },
+                ],
+            )
+            await db["subscriptions"].update_one(
+                {"company_id": company_id},
+                {"$set": {
+                    "pending_downgrade_tier":          tier,
+                    "pending_downgrade_billing_cycle":  billing_cycle,
+                    "pending_downgrade_effective_at":  period_end,
+                    "stripe_schedule_id":              schedule.id,
+                    "updated_at":                       datetime.now(timezone.utc),
+                }},
+            )
+            logger.info(
+                "subscription.change_plan.ok(downgrade_scheduled) company_id=%s tier=%s cycle=%s sub_id=%s "
+                "schedule_id=%s effective_at=%s",
+                company_id, tier, billing_cycle, sub_id, schedule.id, period_end,
+            )
+            return {"ok": True, "requires_payment": False, "client_secret": None, "intent_kind": None}
+
+        # ── Same price — plain immediate switch, unchanged from before ─────
+        updated = stripe.Subscription.modify(
+            sub_id,
+            items=[{"id": item_id, "price": price_id}],
+            proration_behavior="none",
+            payment_behavior="default_incomplete",
+            billing_cycle_anchor="now",
+            expand=["latest_invoice.confirmation_secret", "pending_setup_intent"],
+            metadata=base_metadata,
+        )
+        client_secret, intent_kind, requires_payment = _extract_payment_confirmation(
+            updated.latest_invoice, fallback_subscription=updated,
+        )
         logger.info(
-            "subscription.change_plan.ok company_id=%s tier=%s cycle=%s sub_id=%s requires_payment=%s",
-            company_id, tier, billing_cycle, sub_id, requires_payment,
+            "subscription.change_plan.ok(same_price) company_id=%s tier=%s cycle=%s sub_id=%s "
+            "requires_payment=%s intent_kind=%s",
+            company_id, tier, billing_cycle, sub_id, requires_payment, intent_kind,
         )
         # The customer.subscription.updated webhook will fire next and sync
-        # the new tier/price/period into MongoDB — no manual write needed here.
+        # the new tier/price/period into MongoDB — no manual write needed here
+        # (except the downgrade branch above, which tracks the pending switch
+        # itself since no webhook fires until the schedule's phase change).
         return {
             "ok": True,
             "requires_payment": requires_payment,
             "client_secret": client_secret if requires_payment else None,
+            "intent_kind": intent_kind if requires_payment else None,
         }
     except stripe.StripeError as e:
         logger.error("subscription.change_plan.stripe_error company_id=%s error=%s", company_id, e)
+        return {"error": "stripe_error", "detail": str(e)}
+
+
+async def retry_payment(db: AsyncIOMotorDatabase, company_id: str) -> dict:
+    """
+    Powers the billing page's "Pay Now" button for a past_due/overdue
+    subscription. Returns the open invoice's client_secret in the same
+    {client_secret, intent_kind} shape change_subscription_plan already
+    returns, so the frontend can reuse the exact same StripeElementsProvider
+    + confirm flow — the PaymentElement lets the customer either reuse their
+    saved card or enter a new one.
+    """
+    stripe.api_key = settings.STRIPE_SECRET_KEY
+
+    existing = await db["subscriptions"].find_one({"company_id": company_id})
+    if not existing or not existing.get("stripe_subscription_id"):
+        return {"error": "no_subscription", "detail": "No subscription found."}
+
+    sub_id = existing["stripe_subscription_id"]
+    try:
+        sub = stripe.Subscription.retrieve(
+            sub_id, expand=["latest_invoice.confirmation_secret"],
+        )
+        latest_invoice = sub.latest_invoice
+        invoice_status = getattr(latest_invoice, "status", None) if latest_invoice else None
+        if not latest_invoice or invoice_status == "paid":
+            logger.info("subscription.retry_payment.nothing_due company_id=%s sub_id=%s", company_id, sub_id)
+            return {"ok": True, "requires_payment": False, "client_secret": None, "intent_kind": None}
+
+        client_secret, intent_kind, _ = _extract_payment_confirmation(latest_invoice)
+        if not client_secret:
+            logger.warning(
+                "subscription.retry_payment.no_client_secret company_id=%s sub_id=%s invoice_status=%s",
+                company_id, sub_id, invoice_status,
+            )
+            return {"error": "no_open_invoice", "detail": "No payable invoice found."}
+
+        logger.info(
+            "subscription.retry_payment.ok company_id=%s sub_id=%s intent_kind=%s",
+            company_id, sub_id, intent_kind,
+        )
+        return {
+            "ok": True,
+            "requires_payment": True,
+            "client_secret": client_secret,
+            "intent_kind": intent_kind,
+        }
+    except stripe.StripeError as e:
+        logger.error("subscription.retry_payment.stripe_error company_id=%s error=%s", company_id, e)
         return {"error": "stripe_error", "detail": str(e)}
 
 
@@ -705,6 +931,25 @@ async def cancel_subscription(
         else:
             stripe.Subscription.modify(sub_id, cancel_at_period_end=True)
         logger.info("subscription.cancel.ok company_id=%s immediately=%s", company_id, immediately)
+
+        # Sent synchronously here rather than relying on a webhook: an
+        # immediate cancel does trigger customer.subscription.deleted (which
+        # separately sends send_subscription_ended_email once Stripe gets to
+        # it), but a soft cancel (immediately=False, the dashboard default)
+        # fires no webhook that confirms this to the customer until right
+        # before the period actually ends — leaving the action they just
+        # took completely unacknowledged in the meantime.
+        email, company_name = await _get_company_contact(db, company_id)
+        if email:
+            try:
+                await send_cancellation_received_email(
+                    email, company_name or "there", sub_doc.get("current_period_end"), immediately,
+                )
+            except Exception:
+                logger.warning(
+                    "subscription.cancel.email_failed company_id=%s", company_id, exc_info=True,
+                )
+
         return {"ok": True}
     except stripe.StripeError as e:
         logger.error("subscription.cancel.stripe_error company_id=%s error=%s", company_id, e)
@@ -803,6 +1048,11 @@ async def _on_checkout_completed(db: AsyncIOMotorDatabase, session: Any) -> None
         "trial_start":            trial_start,
         "trial_end":              trial_end,
         "updated_at":             now,
+        # Set here so _on_subscription_upsert's own welcome-email logic
+        # (which handles the custom Stripe-Elements signup flow — the one
+        # actually used by this app's UI) sees it's already been sent for
+        # this sub_id and doesn't send a second copy for the same signup.
+        "welcome_email_sent_for_sub_id": sub_id,
     }
     _mark_free_trial_used(doc, existing_tier, tier)
     _apply_free_tier_trial(doc, tier)
@@ -861,7 +1111,7 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
 
     existing_doc  = await db["subscriptions"].find_one(
         {"company_id": company_id},
-        {"subscription_tier": 1, "billing_cycle": 1, "cancel_at_period_end": 1},
+        {"subscription_tier": 1, "billing_cycle": 1, "cancel_at_period_end": 1, "pending_downgrade_tier": 1},
     )
     existing_tier = _normalize_tier(existing_doc["subscription_tier"]) if existing_doc and existing_doc.get("subscription_tier") else None
     tier          = _normalize_tier(metadata.get("tier") or (existing_doc.get("subscription_tier") if existing_doc else None))
@@ -881,6 +1131,16 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
     doc["updated_at"] = now
     _mark_free_trial_used(doc, existing_tier, tier)
     _apply_free_tier_trial(doc, tier)
+
+    # A scheduled downgrade (change_subscription_plan's Subscription Schedule)
+    # has just taken effect — the phase-2 metadata we set on it is what
+    # produced this new `tier`. Clear the "pending" bookkeeping now that it's
+    # no longer pending.
+    if existing_doc and existing_doc.get("pending_downgrade_tier") == tier:
+        doc["pending_downgrade_tier"] = None
+        doc["pending_downgrade_billing_cycle"] = None
+        doc["pending_downgrade_effective_at"] = None
+        doc["stripe_schedule_id"] = None
 
     set_on_insert: dict[str, Any] = {"created_at": now, "conversations_used": 0}
     if "free_trial_used" not in doc:
@@ -913,6 +1173,36 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
         db, company_id, effective_status, tier,
         doc["current_period_end"], doc["current_period_start"],
     )
+
+    # Welcome/confirmation email — this is what actually fires for the real
+    # signup flow (custom Stripe Elements, create_subscription_intent), unlike
+    # send_subscription_confirmed_email's other call site in
+    # _on_checkout_completed, which only fires for the legacy Stripe-hosted
+    # Checkout path this app's UI doesn't use. Gated on effective_status so it
+    # waits for the customer to actually confirm their card (not the raw
+    # "incomplete" status the instant the Subscription object is created), and
+    # claimed atomically on welcome_email_sent_for_sub_id so it fires exactly
+    # once per real subscription — a later plan change keeps the same sub_id
+    # and is correctly skipped, while a genuine resubscribe-after-cancel gets
+    # a new sub_id and is correctly welcomed again.
+    if effective_status in ("active", "trialing"):
+        claimed_welcome = await db["subscriptions"].find_one_and_update(
+            {"company_id": company_id, "welcome_email_sent_for_sub_id": {"$ne": sub_id}},
+            {"$set": {"welcome_email_sent_for_sub_id": sub_id}},
+        )
+        if claimed_welcome:
+            email, company_name = await _get_company_contact(db, company_id)
+            if email:
+                try:
+                    await send_subscription_confirmed_email(
+                        email, company_name or "there", tier, billing_cycle,
+                        amount, currency, doc.get("current_period_end"),
+                    )
+                    logger.info("subscription.upsert.welcome_email_sent company_id=%s sub_id=%s", company_id, sub_id)
+                except Exception:
+                    logger.warning(
+                        "subscription.upsert.welcome_email_failed company_id=%s", company_id, exc_info=True,
+                    )
 
     # Notify only on the False→True transition so re-saving an already-ending
     # subscription doesn't spam a fresh alert on every webhook delivery.
@@ -1001,17 +1291,32 @@ async def _on_payment_succeeded(db: AsyncIOMotorDatabase, invoice: Any) -> None:
     period_end   = _stripe_ts(getattr(invoice, "period_end", None))
     now          = datetime.now(timezone.utc)
 
+    was_past_due = existing.get("subscription_status") == "past_due"
+
     await db["subscriptions"].update_one(
         {"company_id": company_id},
         {"$set": {
-            "subscription_status":  "active",
-            "current_period_start": period_start,
-            "current_period_end":   period_end,
-            "updated_at":           now,
+            "subscription_status":    "active",
+            "current_period_start":   period_start,
+            "current_period_end":     period_end,
+            "updated_at":             now,
+            # Recovery — clear the whole grace-period episode.
+            "past_due_since":         None,
+            "hard_reminder_sent_at":  None,
+            "is_overdue":             False,
         }},
     )
     tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "active", tier, period_end, period_start)
+
+    if was_past_due:
+        # Undo the chat-answering block immediately — don't make a recovered
+        # customer wait out the 5-minute context cache.
+        await db["users"].update_one(
+            {"_id": _to_object_id(company_id)},
+            {"$set": {"chatbot_overdue": False}},
+        )
+        invalidate_context(company_id)
 
     # New billing period (or the subscription's very first invoice, where
     # usage is already 0) — either way, a fresh period starts with a clean
@@ -1058,9 +1363,33 @@ async def _on_payment_failed(db: AsyncIOMotorDatabase, invoice: Any) -> None:
         {"company_id": company_id},
         {"$set": {"subscription_status": "past_due", "updated_at": now}},
     )
+    # Only start the grace-period clock on the FIRST failure of this
+    # episode — a retry failing again a day later shouldn't push the
+    # deadline back out.
+    claimed_clock_start = await db["subscriptions"].find_one_and_update(
+        {"company_id": company_id, "past_due_since": None},
+        {"$set": {"past_due_since": now}},
+    )
     tier = _normalize_tier(existing.get("subscription_tier"))
     await _sync_users_doc(db, company_id, "past_due", tier, existing.get("current_period_end"))
     await notification_service.create_payment_failed_notification(db, company_id)
+
+    # Best-effort — same reasoning as every other lifecycle email here: don't
+    # let a Resend hiccup turn into a Stripe webhook retry of the whole
+    # handler. Only send on the episode's first failure (claimed above) —
+    # Stripe retries the same invoice multiple times before giving up, and
+    # each of those shouldn't re-send the "payment due" email.
+    if claimed_clock_start:
+        email, company_name = await _get_company_contact(db, company_id)
+        if email:
+            try:
+                grace_period_end = now + timedelta(days=GRACE_PERIOD_DAYS)
+                await send_payment_due_email(email, company_name or "there", grace_period_end)
+            except Exception:
+                logger.warning(
+                    "subscription.payment_failed.email_failed company_id=%s", company_id, exc_info=True,
+                )
+
     logger.info("payment.failed.done company_id=%s", company_id)
 
 
@@ -1113,4 +1442,88 @@ async def send_ending_soon_reminders(db: AsyncIOMotorDatabase) -> None:
         except Exception:
             logger.warning(
                 "subscription.ending_reminder.send_failed company_id=%s", company_id, exc_info=True,
+            )
+
+
+# ── Scheduled job: grace-period dunning (day-3 reminder, day-7 cutoff) ────────
+# Same reasoning as send_ending_soon_reminders above — this is polled by a
+# background loop (see main.py), not triggered by a webhook, since neither
+# "3 days into past_due" nor "7 days into past_due" is a Stripe event.
+
+async def process_overdue_subscriptions(db: AsyncIOMotorDatabase) -> None:
+    """Runs the two time-based steps of the grace-period state machine for
+    every subscription currently past_due:
+
+      - day HARD_REMINDER_AFTER_DAYS: send the escalated reminder email.
+      - day GRACE_PERIOD_DAYS: flip is_overdue, turn the chatbot off, send
+        the final "paused" email.
+
+    Both steps use an atomic find_one_and_update claim (same pattern as
+    send_ending_soon_reminders) so overlapping runs / multiple workers never
+    double-send or double-flip.
+    """
+    now = datetime.now(timezone.utc)
+    hard_reminder_cutoff = now - timedelta(days=HARD_REMINDER_AFTER_DAYS)
+    overdue_cutoff        = now - timedelta(days=GRACE_PERIOD_DAYS)
+
+    # ── Day-3 hard reminder ──────────────────────────────────────────────────
+    cursor = db["subscriptions"].find({
+        "subscription_status":    "past_due",
+        "past_due_since":         {"$ne": None, "$lte": hard_reminder_cutoff},
+        "hard_reminder_sent_at":  None,
+    })
+    async for doc in cursor:
+        company_id = doc["company_id"]
+        claimed = await db["subscriptions"].find_one_and_update(
+            {"_id": doc["_id"], "hard_reminder_sent_at": None},
+            {"$set": {"hard_reminder_sent_at": now}},
+        )
+        if not claimed:
+            continue  # another worker/run already claimed this one
+
+        email, company_name = await _get_company_contact(db, company_id)
+        if not email:
+            logger.warning("subscription.hard_reminder.no_email company_id=%s", company_id)
+            continue
+        try:
+            grace_period_end = doc["past_due_since"] + timedelta(days=GRACE_PERIOD_DAYS)
+            await send_payment_hard_reminder_email(email, company_name or "there", grace_period_end)
+            logger.info("subscription.hard_reminder.sent company_id=%s", company_id)
+        except Exception:
+            logger.warning(
+                "subscription.hard_reminder.send_failed company_id=%s", company_id, exc_info=True,
+            )
+
+    # ── Day-7 overdue cutoff — actually turns the chatbot off ───────────────
+    cursor = db["subscriptions"].find({
+        "subscription_status": "past_due",
+        "past_due_since":      {"$ne": None, "$lte": overdue_cutoff},
+        "is_overdue":          {"$ne": True},
+    })
+    async for doc in cursor:
+        company_id = doc["company_id"]
+        claimed = await db["subscriptions"].find_one_and_update(
+            {"_id": doc["_id"], "is_overdue": {"$ne": True}},
+            {"$set": {"is_overdue": True, "updated_at": now}},
+        )
+        if not claimed:
+            continue  # another worker/run already claimed this one
+
+        await db["users"].update_one(
+            {"_id": _to_object_id(company_id)},
+            {"$set": {"chatbot_overdue": True}},
+        )
+        invalidate_context(company_id)
+        logger.info("subscription.overdue.chatbot_disabled company_id=%s", company_id)
+
+        email, company_name = await _get_company_contact(db, company_id)
+        if not email:
+            logger.warning("subscription.overdue.no_email company_id=%s", company_id)
+            continue
+        try:
+            await send_chatbot_overdue_email(email, company_name or "there")
+            logger.info("subscription.overdue.email_sent company_id=%s", company_id)
+        except Exception:
+            logger.warning(
+                "subscription.overdue.email_failed company_id=%s", company_id, exc_info=True,
             )

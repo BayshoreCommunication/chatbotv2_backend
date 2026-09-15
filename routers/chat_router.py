@@ -43,6 +43,13 @@ router = APIRouter(prefix="/chat", tags=["Chat"])
 widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
 logger = logging.getLogger(__name__)
 
+# Shown to end visitors for ANY failure that isn't their fault — billing
+# overdue, usage cap hit, or a genuine technical failure (LLM provider error,
+# unexpected exception, etc.). Never leak internal error text (provider
+# error codes, stack traces, quota messages) to the widget — visitors don't
+# need or want that, and it can expose implementation details.
+TECHNICAL_ISSUE_REPLY = "We're facing some technical issues right now — please try again a bit later."
+
 # Short acknowledgements that can never contain contact info — skip LLM extraction.
 _SKIP_EXTRACTION_WORDS = frozenset({
     "yes", "no", "okay", "ok", "sure", "hi", "hello",
@@ -297,6 +304,24 @@ async def chat(company_id: str, payload: ChatRequest):
         ctx["entries_stored"], elapsed_ctx,
     )
 
+    # ── Billing gate — subscription overdue past its grace period ───────────
+    # Checked before the visitor-limit gate below since non-payment is a more
+    # fundamental block than a usage cap. `chatbot_overdue` is set by
+    # services.subscription.subscription_service.process_overdue_subscriptions
+    # once a past_due subscription's grace period (see GRACE_PERIOD_DAYS)
+    # lapses with no successful payment — the dashboard itself is never
+    # gated on this, only the actual chat-answering path. channel="test" is
+    # exempt for the same reason it's exempt from the visitor-limit gate
+    # below — that's the owner previewing their own bot, not a real visitor.
+    if payload.channel != "test" and ctx.get("chatbot_overdue"):
+        logger.info("chat.request.blocked_overdue company_id=%s channel=%s", company_id, payload.channel)
+        return ChatResponse(
+            reply=TECHNICAL_ISSUE_REPLY,
+            session_id=payload.session_id,
+            company_id=company_id,
+            tools_used=[],
+        )
+
     # ── Visitor limit gate — shared across widget/Messenger/Instagram/WhatsApp ─
     # Checked before the (expensive) agent build/invoke below. visitor_id is
     # the widget's persistent per-browser ID when present; every channel that
@@ -315,7 +340,7 @@ async def chat(company_id: str, payload: ChatRequest):
             company_id, payload.channel, payload.session_id,
         )
         return ChatResponse(
-            reply="We're facing some technical issues right now — please try again a bit later.",
+            reply=TECHNICAL_ISSUE_REPLY,
             session_id=payload.session_id,
             company_id=company_id,
             tools_used=[],
@@ -416,13 +441,20 @@ async def chat(company_id: str, payload: ChatRequest):
             config=config,
         )
     except Exception as exc:
+        # Never leak the raw exception (LLM provider error codes/messages,
+        # quota errors, stack traces, etc.) to the widget — log it for us,
+        # show visitors a plain fallback instead. This covers any technical
+        # failure (OpenAI quota/outage, tool errors, timeouts, ...), not just
+        # the billing-overdue and usage-cap cases already handled above.
         logger.exception(
             "chat.agent.failed company_id=%s session_id=%s error=%s",
             company_id, payload.session_id, exc,
         )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Agent error: {str(exc)}",
+        return ChatResponse(
+            reply=TECHNICAL_ISSUE_REPLY,
+            session_id=payload.session_id,
+            company_id=company_id,
+            tools_used=[],
         )
 
     elapsed_invoke = int((time.monotonic() - t_invoke) * 1000)
@@ -456,30 +488,39 @@ async def chat(company_id: str, payload: ChatRequest):
 
     # ── Side-effect: extract lead info, update cache, persist ────────────────
     # Happens AFTER the LLM reply — does NOT influence the response content.
+    # Best-effort: the agent already produced a real answer at this point, so
+    # a failure here (DB hiccup, extraction error) must never turn a
+    # successful reply into an error for the visitor — log and move on.
     # Skip LLM extraction for short acknowledgements that can't contain contact info.
-    _stripped_lower = payload.message.strip().lower()
-    if _stripped_lower in _SKIP_EXTRACTION_WORDS or len(_stripped_lower) < 4:
-        message_lead = LeadInfo()
-    else:
-        message_lead = await extract_lead_info_async(payload.message)
+    try:
+        _stripped_lower = payload.message.strip().lower()
+        if _stripped_lower in _SKIP_EXTRACTION_WORDS or len(_stripped_lower) < 4:
+            message_lead = LeadInfo()
+        else:
+            message_lead = await extract_lead_info_async(payload.message)
 
-    if message_lead.has_any:
-        update_session_lead(
-            thread_id=thread_id,
-            name=message_lead.name,
-            phone=message_lead.phone,
-            email=message_lead.email,
+        if message_lead.has_any:
+            update_session_lead(
+                thread_id=thread_id,
+                name=message_lead.name,
+                phone=message_lead.phone,
+                email=message_lead.email,
+            )
+
+        await _persist_exchange(
+            company_id=company_id,
+            session_id=payload.session_id,
+            user_message=payload.message,
+            ai_reply=reply,
+            tools_used=tools_used,
+            lead_info=message_lead,
+            visitor_id=payload.visitor_id,
         )
-
-    await _persist_exchange(
-        company_id=company_id,
-        session_id=payload.session_id,
-        user_message=payload.message,
-        ai_reply=reply,
-        tools_used=tools_used,
-        lead_info=message_lead,
-        visitor_id=payload.visitor_id,
-    )
+    except Exception:
+        logger.exception(
+            "chat.post_reply_side_effects_failed company_id=%s session_id=%s",
+            company_id, payload.session_id,
+        )
 
     return ChatResponse(
         reply=reply,
@@ -936,59 +977,75 @@ async def widget_ask(
 
     session_id = (x_session_id or "default").strip() or "default"
 
-    # Check human takeover — if active, store user message silently and return empty answer
-    db = get_database()
-    session_doc = await db["chat_sessions"].find_one(
-        {"company_id": company_id, "session_id": session_id},
-        {"human_takeover": 1},
-    )
-    if session_doc and session_doc.get("human_takeover"):
-        now = datetime.now(timezone.utc)
-        await db["chat_sessions"].update_one(
+    # chat() already turns its own failures (LLM/agent errors, billing gates,
+    # usage caps) into a friendly WidgetChatResponse-shaped reply. This wraps
+    # the rest of this endpoint's own work too (session lookups, dashboard
+    # websocket notifications) so ANY unexpected failure here still returns a
+    # normal 200 with a friendly chat message instead of a raw error reaching
+    # the widget.
+    try:
+        # Check human takeover — if active, store user message silently and return empty answer
+        db = get_database()
+        session_doc = await db["chat_sessions"].find_one(
             {"company_id": company_id, "session_id": session_id},
-            {
-                "$push": {"messages": {"role": "user", "content": payload.message, "timestamp": now}},
-                "$set": {"updated_at": now},
-            },
+            {"human_takeover": 1},
         )
+        if session_doc and session_doc.get("human_takeover"):
+            now = datetime.now(timezone.utc)
+            await db["chat_sessions"].update_one(
+                {"company_id": company_id, "session_id": session_id},
+                {
+                    "$push": {"messages": {"role": "user", "content": payload.message, "timestamp": now}},
+                    "$set": {"updated_at": now},
+                },
+            )
+            await ws_manager.notify_dashboard(company_id, {
+                "type": "new_message",
+                "session_id": session_id,
+                "content": payload.message,
+                "timestamp": now.isoformat(),
+            })
+            return WidgetChatResponse(answer="", session_id=session_id, company_id=company_id)
+
         await ws_manager.notify_dashboard(company_id, {
             "type": "new_message",
             "session_id": session_id,
             "content": payload.message,
-            "timestamp": now.isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         })
-        return WidgetChatResponse(answer="", session_id=session_id, company_id=company_id)
+        await ws_manager.notify_dashboard(company_id, {
+            "type": "typing_start",
+            "session_id": session_id,
+        })
 
-    await ws_manager.notify_dashboard(company_id, {
-        "type": "new_message",
-        "session_id": session_id,
-        "content": payload.message,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    await ws_manager.notify_dashboard(company_id, {
-        "type": "typing_start",
-        "session_id": session_id,
-    })
+        chat_request = ChatRequest(
+            session_id=session_id,
+            visitor_id=(x_visitor_id or "").strip() or None,
+            message=payload.message,
+        )
+        chat_response = await chat(company_id, chat_request)
 
-    chat_request = ChatRequest(
-        session_id=session_id,
-        visitor_id=(x_visitor_id or "").strip() or None,
-        message=payload.message,
-    )
-    chat_response = await chat(company_id, chat_request)
+        await ws_manager.notify_dashboard(company_id, {
+            "type": "ai_reply",
+            "session_id": session_id,
+            "content": chat_response.reply,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
 
-    await ws_manager.notify_dashboard(company_id, {
-        "type": "ai_reply",
-        "session_id": session_id,
-        "content": chat_response.reply,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-
-    return WidgetChatResponse(
-        answer=chat_response.reply,
-        session_id=chat_response.session_id,
-        company_id=chat_response.company_id,
-    )
+        return WidgetChatResponse(
+            answer=chat_response.reply,
+            session_id=chat_response.session_id,
+            company_id=chat_response.company_id,
+        )
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception(
+            "widget_ask.failed company_id=%s session_id=%s", company_id, session_id,
+        )
+        return WidgetChatResponse(
+            answer=TECHNICAL_ISSUE_REPLY, session_id=session_id, company_id=company_id,
+        )
 
 
 @widget_router.get("/history", summary="Widget session history")

@@ -12,7 +12,7 @@ Stripe for routine access checks.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -58,6 +58,20 @@ CONVERSATION_LIMITS: dict[SubscriptionTier, Optional[int]] = {
     "advanced":     2500,
     "enterprise":   None,   # unlimited (custom contract may override manually)
 }
+
+
+# ── Payment-failure grace period ───────────────────────────────────────────────
+# When a charge fails (post-trial or any later renewal), the subscription
+# becomes `past_due`. The company keeps full access — dashboard AND chatbot —
+# for GRACE_PERIOD_DAYS while we email reminders; only once that window closes
+# with still no successful payment does the chatbot actually stop answering
+# (`is_overdue` flips True). The dashboard itself is never blocked, even after
+# that point — only the live chat-answering path checks `is_overdue`.
+GRACE_PERIOD_DAYS = 7
+
+# Day within the grace period the escalated "final notice" reminder goes out
+# (in addition to the immediate email sent the moment the charge fails).
+HARD_REMINDER_AFTER_DAYS = 3
 
 
 # ── Enterprise custom contract details ────────────────────────────────────────
@@ -140,6 +154,56 @@ class SubscriptionModel(BaseModel):
         ),
     )
 
+    # ── Payment-failure grace period ─────────────────────────────────────────
+    # See GRACE_PERIOD_DAYS / HARD_REMINDER_AFTER_DAYS above. All three are
+    # cleared back to their defaults the moment a payment succeeds again.
+    past_due_since: Optional[datetime] = Field(
+        None,
+        description=(
+            "Set the first time a charge fails while the subscription is "
+            "otherwise healthy (post-trial or any renewal). Marks the start "
+            "of the grace-period clock; not reset by repeated retry failures "
+            "within the same grace period."
+        ),
+    )
+    hard_reminder_sent_at: Optional[datetime] = Field(
+        None,
+        description=(
+            "Set once the day-3 escalated 'final notice' reminder email has "
+            "been sent for the current past_due episode, so the background "
+            "job never sends it twice."
+        ),
+    )
+    is_overdue: bool = Field(
+        False,
+        description=(
+            "True once past_due_since is more than GRACE_PERIOD_DAYS old with "
+            "still no successful payment. This is the flag the chat-answering "
+            "path checks (mirrored onto users.chatbot_overdue) — the dashboard "
+            "itself never checks this; it stays reachable regardless."
+        ),
+    )
+
+    # ── Pending downgrade ─────────────────────────────────────────────────────
+    # Set by change_subscription_plan's downgrade branch, which creates a
+    # Stripe Subscription Schedule instead of switching the price right away
+    # (no charge, no refund — the customer keeps their current tier until the
+    # period they already paid for ends). Cleared once the schedule's second
+    # phase actually takes effect (customer.subscription.updated syncs the
+    # new tier and this block is cleared alongside it).
+    pending_downgrade_tier: Optional[SubscriptionTier] = Field(
+        None, description="Tier the subscription is scheduled to switch to at renewal."
+    )
+    pending_downgrade_billing_cycle: Optional[BillingCycle] = Field(
+        None, description="Billing cycle paired with pending_downgrade_tier."
+    )
+    pending_downgrade_effective_at: Optional[datetime] = Field(
+        None, description="When the scheduled downgrade takes effect (== current_period_end at request time)."
+    )
+    stripe_schedule_id: Optional[str] = Field(
+        None, description="Stripe Subscription Schedule ID (sub_sched_...) driving the pending downgrade."
+    )
+
     # ── Status ────────────────────────────────────────────────────────────────
     subscription_status:  SubscriptionStatus = "active"
     cancel_at_period_end: bool = Field(
@@ -157,6 +221,14 @@ class SubscriptionModel(BaseModel):
         description=(
             "Set once the ~1-day-before-period-end reminder email has been sent, so the "
             "background reminder loop never emails the same cancellation twice."
+        ),
+    )
+    welcome_email_sent_for_sub_id: Optional[str] = Field(
+        None,
+        description=(
+            "The stripe_subscription_id the welcome/confirmation email has already been "
+            "sent for, so a later plan change on the same subscription doesn't re-send it "
+            "while a genuine resubscribe-after-cancel (a new sub_...) correctly gets one."
         ),
     )
     collection_method: Literal["charge_automatically", "send_invoice"] = Field(
@@ -224,6 +296,13 @@ class SubscriptionModel(BaseModel):
             return self.trial_end
         return self.current_period_end
 
+    @property
+    def grace_period_end(self) -> Optional[datetime]:
+        """When the chatbot will/did turn off, if currently past_due."""
+        if not self.past_due_since:
+            return None
+        return self.past_due_since + timedelta(days=GRACE_PERIOD_DAYS)
+
 
 # ── Lightweight response schema (safe for frontend) ───────────────────────────
 
@@ -246,6 +325,11 @@ class SubscriptionResponse(BaseModel):
     conversation_limit:     Optional[int] = None
     conversations_used:     int = 0
     free_trial_used:        bool = False
+    past_due_since:         Optional[datetime] = None
+    grace_period_end:       Optional[datetime] = None
+    is_overdue:             bool = False
+    pending_downgrade_tier: Optional[SubscriptionTier] = None
+    pending_downgrade_effective_at: Optional[datetime] = None
     created_at:             datetime
     updated_at:             datetime
 

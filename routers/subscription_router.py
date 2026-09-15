@@ -6,6 +6,7 @@ Subscription endpoints.
   POST /subscription/checkout/{company_id}     — create Stripe Checkout session (legacy redirect flow)
   POST /subscription/create/{company_id}       — custom signup (Stripe Elements, no redirect)
   POST /subscription/change-plan/{company_id}  — switch plan directly (existing card on file)
+  POST /subscription/retry-payment/{company_id} — get client_secret to pay an open invoice
   POST /subscription/portal/{company_id}       — create Stripe billing portal session
   POST /subscription/cancel/{company_id}       — cancel subscription
   GET  /subscription/{company_id}              — get current subscription status
@@ -17,7 +18,7 @@ from __future__ import annotations
 import logging
 
 import stripe
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
@@ -25,7 +26,7 @@ from pydantic import BaseModel
 
 from config import settings
 from database import get_database
-from model.subscription_model import SubscriptionResponse
+from model.subscription_model import GRACE_PERIOD_DAYS, SubscriptionResponse
 from services.subscription.subscription_service import (
     cancel_subscription,
     change_subscription_plan,
@@ -34,6 +35,7 @@ from services.subscription.subscription_service import (
     create_subscription_intent,
     get_subscription,
     handle_webhook_event,
+    retry_payment,
 )
 
 router = APIRouter(prefix="/subscription", tags=["Subscription"])
@@ -147,7 +149,22 @@ async def change_plan(
         billing_cycle=payload.billing_cycle,
     )
     _raise_service_error(result)
-    return result   # {"ok", "requires_payment", "client_secret"}
+    return result   # {"ok", "requires_payment", "client_secret", "intent_kind"}
+
+
+# ── POST /subscription/retry-payment/{company_id} ────────────────────────────
+
+@router.post(
+    "/retry-payment/{company_id}",
+    summary="Get a client_secret to pay an open invoice (past_due 'Pay Now' button)",
+)
+async def retry_payment_route(
+    company_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    result = await retry_payment(db=db, company_id=company_id)
+    _raise_service_error(result)
+    return result   # {"ok", "requires_payment", "client_secret", "intent_kind"}
 
 
 # ── POST /subscription/portal/{company_id} ───────────────────────────────────
@@ -224,6 +241,9 @@ async def get_status(
             conversation_limit=1000,
             conversations_used=0,
             free_trial_used=False,
+            past_due_since=None,
+            grace_period_end=None,
+            is_overdue=False,
             created_at=now_aware,
             updated_at=now_aware,
         )
@@ -231,6 +251,10 @@ async def get_status(
     status_val = doc.get("subscription_status", "active")
     trial_end  = doc.get("trial_end")
     is_active  = status_val in ("active", "trialing")
+    past_due_since = doc.get("past_due_since")
+    grace_period_end = (
+        past_due_since + timedelta(days=GRACE_PERIOD_DAYS) if past_due_since else None
+    )
     # MongoDB stores naive UTC datetimes; strip tzinfo before comparing
     trial_end_naive = trial_end.replace(tzinfo=None) if trial_end and trial_end.tzinfo else trial_end
     is_in_trial = (
@@ -254,6 +278,11 @@ async def get_status(
         conversation_limit=doc.get("conversation_limit", 1000),
         conversations_used=doc.get("conversations_used", 0),
         free_trial_used=doc.get("free_trial_used", False),
+        past_due_since=past_due_since,
+        grace_period_end=grace_period_end,
+        is_overdue=doc.get("is_overdue", False),
+        pending_downgrade_tier=doc.get("pending_downgrade_tier"),
+        pending_downgrade_effective_at=doc.get("pending_downgrade_effective_at"),
         created_at=doc.get("created_at", now),
         updated_at=doc.get("updated_at", now),
     )

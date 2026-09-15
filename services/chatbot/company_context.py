@@ -66,6 +66,7 @@ async def get_company_context(company_id: str) -> dict[str, Any] | None:
         categories      list[str]
         namespace       str          ← same as company_id when trained
         is_active       bool
+        chatbot_overdue bool         ← True once billing grace period has lapsed
     """
     t0 = time.monotonic()
 
@@ -139,6 +140,7 @@ async def get_company_context(company_id: str) -> dict[str, Any] | None:
             "categories":      categories,
             "namespace":       namespace,
             "is_active":       bool(user_doc.get("is_active", True)),
+            "chatbot_overdue": bool(user_doc.get("chatbot_overdue", False)),
         }
 
         _ctx_cache[company_id] = {"data": ctx, "expires": time.monotonic() + _CTX_TTL}
