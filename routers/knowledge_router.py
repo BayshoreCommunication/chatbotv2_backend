@@ -15,7 +15,7 @@ from typing import Any
 from bson import ObjectId
 from fastapi import APIRouter, HTTPException, status, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 from database import get_database
 from services.knowledgebase import train_company
@@ -128,7 +128,8 @@ async def train(
     db: AsyncIOMotorDatabase = Depends(get_database),
 ):
     """
-    1. Crawls all pages reachable from `website_url` (same domain, max 25 pages).
+    1. Crawls all pages reachable from `website_url` (same domain, max 50 pages,
+       seeded from the site's sitemap.xml when available).
     2. Splits content into chunks and embeds with OpenAI.
     3. Upserts vectors into Pinecone under `namespace = company_id`.
     4. Calculates a quality score (0–100) and saves metadata to MongoDB.
@@ -255,6 +256,7 @@ async def train(
         last_updated=result.last_updated,
         entries=[e for e in result.knowledge_entries],
         missing_info=result.missing_info,
+        structured_data=result.structured_data,
     )
     await db["knowledge_base"].update_one(
         {"company_id": company_id},

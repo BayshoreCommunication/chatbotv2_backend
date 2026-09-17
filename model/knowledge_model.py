@@ -47,7 +47,7 @@ Document shape in MongoDB:
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 
@@ -98,6 +98,7 @@ class TrainResult(BaseModel):
     last_updated:      datetime
     knowledge_entries: list[dict] = Field(default_factory=list)
     missing_info:      list[MissingInfoItem] = Field(default_factory=list)
+    structured_data:   dict[str, Any] = Field(default_factory=dict)
     error:             Optional[str] = None
 
 
@@ -139,6 +140,13 @@ class KnowledgeBaseDocument(BaseModel):
     missing_info: list[MissingInfoItem] = Field(
         default_factory=list,
         description="Required info items not found on the website — user can fill these in manually.",
+    )
+
+    # ── Structured data (JSON-LD / schema.org) found on the site ──────────────
+    structured_data: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Organization/LocalBusiness fields (name, telephone, email, address, "
+                     "opening_hours, same_as) parsed from the site's JSON-LD, if present.",
     )
 
     # ── Run history (populated via $push in router) ───────────────────────────

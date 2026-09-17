@@ -146,6 +146,7 @@ async def extract_knowledge(
     company_type: str,
     crawled_pages: list[dict],
     search_results: list[dict],
+    structured_data: Optional[dict] = None,
     on_batch_done: Optional[Callable[[str, list[dict]], Awaitable[None]]] = None,
 ) -> list[dict]:
     """
@@ -249,6 +250,7 @@ async def extract_knowledge(
         crawled_pages=crawled_pages,
         search_results=search_results,
         existing_entries=all_entries,
+        structured_data=structured_data or {},
     )
     if fallback_entries:
         logger.info(
@@ -270,11 +272,14 @@ def _extract_critical_fallback_entries(
     crawled_pages: list[dict],
     search_results: list[dict],
     existing_entries: list[dict],
+    structured_data: Optional[dict] = None,
 ) -> list[dict]:
+    structured_data = structured_data or {}
     categories = {str(e.get("category", "")).strip().lower() for e in existing_entries}
     need_contact = "contact" not in categories
     need_services = "services" not in categories
-    if not need_contact and not need_services:
+    need_overview = "overview" not in categories
+    if not need_contact and not need_services and not need_overview:
         return []
 
     pages_text = "\n".join(str(p.get("raw_text", "")) for p in crawled_pages)
@@ -285,26 +290,56 @@ def _extract_critical_fallback_entries(
 
     entries: list[dict] = []
 
+    if need_overview and structured_data.get("description"):
+        entries.append(
+            {
+                "topic": "Company Overview",
+                "content": f"{company_name}: {structured_data['description']}",
+                "category": "overview",
+                "source_url": "structured_data",
+            }
+        )
+
     if need_contact:
-        email_match = EMAIL_RE.search(source_text)
-        phone_match = PHONE_RE.search(source_text)
-        address_match = ADDRESS_HINT_RE.search(source_text)
-        if email_match or phone_match or address_match:
-            parts: list[str] = []
-            if email_match:
-                parts.append(f"Email: {email_match.group(0)}")
-            if phone_match:
-                parts.append(f"Phone: {phone_match.group(0).strip()}")
-            if address_match:
-                parts.append(f"Address: {address_match.group(0).strip()}")
+        struct_parts: list[str] = []
+        if structured_data.get("telephone"):
+            struct_parts.append(f"Phone: {structured_data['telephone']}")
+        if structured_data.get("email"):
+            struct_parts.append(f"Email: {structured_data['email']}")
+        if structured_data.get("address"):
+            struct_parts.append(f"Address: {structured_data['address']}")
+        if structured_data.get("opening_hours"):
+            struct_parts.append(f"Hours: {structured_data['opening_hours']}")
+
+        if struct_parts:
             entries.append(
                 {
                     "topic": "Contact Details",
-                    "content": f"{company_name} contact information found in source content. " + " ".join(parts),
+                    "content": f"{company_name} contact information. " + " ".join(struct_parts),
                     "category": "contact",
-                    "source_url": "web_search",
+                    "source_url": "structured_data",
                 }
             )
+        else:
+            email_match = EMAIL_RE.search(source_text)
+            phone_match = PHONE_RE.search(source_text)
+            address_match = ADDRESS_HINT_RE.search(source_text)
+            if email_match or phone_match or address_match:
+                parts: list[str] = []
+                if email_match:
+                    parts.append(f"Email: {email_match.group(0)}")
+                if phone_match:
+                    parts.append(f"Phone: {phone_match.group(0).strip()}")
+                if address_match:
+                    parts.append(f"Address: {address_match.group(0).strip()}")
+                entries.append(
+                    {
+                        "topic": "Contact Details",
+                        "content": f"{company_name} contact information found in source content. " + " ".join(parts),
+                        "category": "contact",
+                        "source_url": "page_content",
+                    }
+                )
 
     if need_services:
         service_bits: list[str] = []
@@ -327,7 +362,7 @@ def _extract_critical_fallback_entries(
                     "topic": "Services Overview",
                     "content": f"{company_name} services mentioned in source content: " + " | ".join(service_bits[:4]),
                     "category": "services",
-                    "source_url": "web_search",
+                    "source_url": "page_content",
                 }
             )
 

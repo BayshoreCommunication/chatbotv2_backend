@@ -48,7 +48,11 @@ _REQUIRED_CHECKS = [
     {
         "key": "about_details",
         "label": "About / Company Details",
-        "categories": {"team", "about"},
+        # "about" is never actually emitted by the extractor (its category
+        # enum doesn't include it) — founding/mission/story content almost
+        # always lands under "overview" instead, so that has to be accepted
+        # here too or this check can never be satisfied.
+        "categories": {"team", "about", "overview"},
         "keywords": ["founded", "mission", "vision", "history", "about us", "our story"],
     },
     {
@@ -164,12 +168,21 @@ async def train_company(
 
     # ── Step 1: Crawl website ─────────────────────────────────────────────────
     logger.info("knowledgebase.step=1 crawling website=%s", website_url)
+
+    async def _on_crawl_progress(message: str) -> None:
+        # Sub-steps (sitemap check/result) live inside the 2%-20% crawl band.
+        percent = 8 if "sitemap" in message.lower() and ("found" in message.lower() or "no sitemap" in message.lower()) else 5
+        await _report(percent, "crawl", message)
+
     try:
-        crawled_pages = await crawl_website(website_url)
+        crawled_pages, structured_data = await crawl_website(
+            website_url, on_progress=_on_crawl_progress,
+        )
         logger.info("knowledgebase.step=1 completed. crawled %d pages.", len(crawled_pages))
     except Exception as e:
         logger.exception("knowledgebase.step=1 failed during crawl_website: %s", e)
         crawled_pages = []
+        structured_data = {}
 
     if not crawled_pages:
         logger.warning(
@@ -177,7 +190,18 @@ async def train_company(
             "continuing_with_web_search=true",
             company_id, website_url,
         )
-    await _report(20, "crawl", f"Crawled {len(crawled_pages)} page(s) from your website")
+
+    crawl_found = None
+    if structured_data:
+        crawl_found = [{
+            "category":   "contact",
+            "label":      "Structured company info found (phone, address, hours)",
+            "source_url": "structured_data",
+        }]
+    await _report(
+        20, "crawl", f"Crawled {len(crawled_pages)} page(s) from your website",
+        found=crawl_found,
+    )
 
     # ── Step 2: Enrich with web search ────────────────────────────────────────
     logger.info("knowledgebase.step=2 web_search company=%s", company_name)
@@ -243,6 +267,7 @@ async def train_company(
             company_type=company_type,
             crawled_pages=crawled_pages,
             search_results=search_results,
+            structured_data=structured_data,
             on_batch_done=_on_batch_done if on_progress else None,
         )
         logger.info("knowledgebase.step=3 completed. extracted %d entries.", len(knowledge_entries))
@@ -315,6 +340,7 @@ async def train_company(
         "categories":      sorted(categories),
         "knowledge_entries": knowledge_entries,
         "missing_info":    missing_info,
+        "structured_data": structured_data,
     }
     logger.info(
         "knowledgebase.train.complete company_id=%s score=%.1f entries=%d categories=%s",
