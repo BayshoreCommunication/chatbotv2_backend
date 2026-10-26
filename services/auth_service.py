@@ -18,8 +18,15 @@ from utils.email import send_otp_email, send_login_otp_email
 logger = logging.getLogger(__name__)
 
 
+MAX_OTP_ATTEMPTS = 5
+
+
 def _generate_otp() -> str:
-    return "".join(random.choices(string.digits, k=6))
+    return "".join(secrets.choice(string.digits) for _ in range(6))
+
+
+def _otp_matches(stored: str | None, given: str) -> bool:
+    return bool(stored) and secrets.compare_digest(str(stored), str(given))
 
 
 def create_access_token(data: dict) -> str:
@@ -91,7 +98,12 @@ async def verify_otp(db: AsyncIOMotorDatabase, payload: OTPVerifyRequest) -> dic
     if not temp:
         return {"error": "otp_not_found"}
 
-    if temp.get("otp_code") != payload.otp_code:
+    if not _otp_matches(temp.get("otp_code"), payload.otp_code):
+        attempts = int(temp.get("otp_attempts", 0)) + 1
+        if attempts >= MAX_OTP_ATTEMPTS:
+            await db["temp_signups"].delete_one({"email": payload.email})
+        else:
+            await db["temp_signups"].update_one({"email": payload.email}, {"$set": {"otp_attempts": attempts}})
         return {"error": "invalid_otp"}
 
     otp_expires_at = temp.get("otp_expires_at", datetime.now(timezone.utc))
@@ -146,38 +158,10 @@ async def signin(db: AsyncIOMotorDatabase, payload: SigninRequest) -> dict:
     user = await db["users"].find_one({"email": payload.email})
 
     if not user:
-        # Check team_access — active members skip the password requirement
-        # because they already verified their email via the invite link.
-        from services.team_access_service import signin_team_member
-        team_result = await signin_team_member(db, payload.email)
-        if team_result.get("error"):
-            err = team_result["error"]
-            # Surface specific team errors; fall back to generic for unknown email
-            if err in ("team_member_not_verified", "account_disabled", "owner_not_found"):
-                return {"error": err}
-            return {"error": "invalid_credentials"}
-
-        owner = team_result["owner"]
-        token = create_access_token({
-            "sub":            str(owner["_id"]),
-            "email":          owner["email"],
-            "role":           owner["role"],
-            "team_member":    True,
-            "team_email":     team_result["member_email"],
-            "team_access_id": team_result["team_access_id"],
-        })
-        return {
-            "access_token":          token,
-            "token_type":            "bearer",
-            "user_id":               str(owner["_id"]),
-            "company_name":          owner["company_name"],
-            "role":                  owner["role"],
-            "has_paid_subscription": bool(owner.get("has_paid_subscription", False)),
-            "subscription_type":     owner.get("subscription_type", "free"),
-            "is_team_member":        True,
-            "team_member_email":     team_result["member_email"],
-            "team_member_name":      team_result["member_name"],
-        }
+        # Team members have no password — they sign in with an emailed code
+        # (request_login_otp / verify_login_otp). Never issue a token here
+        # for an email that has no user account.
+        return {"error": "invalid_credentials"}
 
     if not verify_password(payload.password, user["hashed_password"]):
         return {"error": "invalid_credentials"}
@@ -231,7 +215,7 @@ async def request_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPRequest) 
 
     await db["users"].update_one(
         {"_id": user["_id"]},
-        {"$set": {"otp_code": otp, "otp_expires_at": otp_expires}},
+        {"$set": {"otp_code": otp, "otp_expires_at": otp_expires, "otp_attempts": 0}},
     )
 
     try:
@@ -288,7 +272,12 @@ async def verify_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPVerifyRequ
 
     if not user.get("otp_code"):
         return {"error": "otp_not_requested"}
-    if user.get("otp_code") != payload.otp_code:
+    if not _otp_matches(user.get("otp_code"), payload.otp_code):
+        attempts = int(user.get("otp_attempts", 0)) + 1
+        update = {"otp_attempts": attempts}
+        if attempts >= MAX_OTP_ATTEMPTS:
+            update.update({"otp_code": None, "otp_expires_at": None})
+        await db["users"].update_one({"_id": user["_id"]}, {"$set": update})
         return {"error": "invalid_otp"}
 
     otp_expires_at = user.get("otp_expires_at", datetime.now(timezone.utc))

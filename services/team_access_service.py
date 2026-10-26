@@ -204,12 +204,12 @@ async def request_team_otp(db: AsyncIOMotorDatabase, email: str) -> dict:
     if not member:
         return {"error": "not_team_member"}
 
-    otp     = "".join(random.choices(string.digits, k=6))
+    otp     = "".join(secrets.choice(string.digits) for _ in range(6))
     expires = _now() + timedelta(minutes=OTP_EXPIRE_MINUTES)
 
     await db["team_access"].update_one(
         {"_id": member["_id"]},
-        {"$set": {"otp_code": otp, "otp_expires_at": expires, "updated_at": _now()}},
+        {"$set": {"otp_code": otp, "otp_expires_at": expires, "otp_attempts": 0, "updated_at": _now()}},
     )
 
     try:
@@ -235,7 +235,12 @@ async def verify_team_otp(db: AsyncIOMotorDatabase, email: str, otp_code: str) -
 
     if not member.get("otp_code"):
         return {"error": "otp_not_requested"}
-    if member["otp_code"] != otp_code:
+    if not secrets.compare_digest(str(member["otp_code"]), str(otp_code)):
+        attempts = int(member.get("otp_attempts", 0)) + 1
+        update = {"otp_attempts": attempts, "updated_at": _now()}
+        if attempts >= 5:
+            update.update({"otp_code": None, "otp_expires_at": None})
+        await db["team_access"].update_one({"_id": member["_id"]}, {"$set": update})
         return {"error": "invalid_otp"}
 
     expires = member.get("otp_expires_at")
