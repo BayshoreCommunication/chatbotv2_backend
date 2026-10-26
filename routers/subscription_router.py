@@ -84,6 +84,8 @@ def _raise_service_error(result: dict) -> None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail)
     if err == "invalid_plan":
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+    if err == "already_subscribed":
+        raise HTTPException(status.HTTP_409_CONFLICT, detail)
     raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail)
 
 

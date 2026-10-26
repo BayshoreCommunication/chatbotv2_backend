@@ -118,6 +118,24 @@ def _to_object_id(company_id: str):
         return company_id
 
 
+_LIVE_STATUSES = ("active", "trialing", "past_due")
+
+
+def _is_stale_subscription_event(existing_doc: dict | None, sub_id: str) -> bool:
+    """A company has exactly one subscription doc, so a webhook about some
+    *other* still-live paid subscription (e.g. a leftover duplicate) must not
+    overwrite or cancel it. A free-tier stored sub is excluded on purpose: a
+    paid sub taking over from it is the normal upgrade path."""
+    if not existing_doc:
+        return False
+    stored_id = existing_doc.get("stripe_subscription_id")
+    if not stored_id or stored_id == sub_id:
+        return False
+    if _normalize_tier(existing_doc.get("subscription_tier")) == "free":
+        return False
+    return existing_doc.get("subscription_status") in _LIVE_STATUSES
+
+
 async def _get_company_contact(
     db: AsyncIOMotorDatabase, company_id: str,
 ) -> tuple[str | None, str | None]:
@@ -450,6 +468,23 @@ async def create_subscription_intent(
     existing        = await db["subscriptions"].find_one({"company_id": company_id})
     customer_id     = (existing or {}).get("stripe_customer_id")
     existing_sub_id = (existing or {}).get("stripe_subscription_id")
+
+    # A paying customer must switch plans via change_subscription_plan —
+    # creating a second subscription would leave both billing in parallel.
+    if (
+        existing
+        and existing_sub_id
+        and _normalize_tier(existing.get("subscription_tier")) != "free"
+        and existing.get("subscription_status") in _LIVE_STATUSES
+    ):
+        logger.warning(
+            "subscription.create_intent.already_subscribed company_id=%s sub_id=%s",
+            company_id, existing_sub_id,
+        )
+        return {
+            "error": "already_subscribed",
+            "detail": "This account already has an active subscription — use change plan instead.",
+        }
 
     # Before creating a new Stripe subscription, check whether there is already
     # an incomplete or trialing subscription for the same plan. Reusing it means
@@ -1171,8 +1206,17 @@ async def _on_subscription_upsert(db: AsyncIOMotorDatabase, sub: Any) -> None:
 
     existing_doc  = await db["subscriptions"].find_one(
         {"company_id": company_id},
-        {"subscription_tier": 1, "billing_cycle": 1, "cancel_at_period_end": 1, "pending_downgrade_tier": 1},
+        {
+            "subscription_tier": 1, "billing_cycle": 1, "cancel_at_period_end": 1,
+            "pending_downgrade_tier": 1, "stripe_subscription_id": 1, "subscription_status": 1,
+        },
     )
+    if _is_stale_subscription_event(existing_doc, sub_id):
+        logger.warning(
+            "subscription.upsert.ignored_stale company_id=%s event_sub_id=%s stored_sub_id=%s",
+            company_id, sub_id, existing_doc.get("stripe_subscription_id"),
+        )
+        return
     existing_tier = _normalize_tier(existing_doc["subscription_tier"]) if existing_doc and existing_doc.get("subscription_tier") else None
     tier          = _normalize_tier(metadata.get("tier") or (existing_doc.get("subscription_tier") if existing_doc else None))
     billing_cycle = metadata.get("billing_cycle") or (existing_doc.get("billing_cycle") if existing_doc else None) or "monthly"
@@ -1296,6 +1340,17 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
             company_id = existing["company_id"]
     if not company_id:
         logger.warning("subscription.deleted.no_company_id sub_id=%s", sub_id)
+        return
+
+    current_doc = await db["subscriptions"].find_one(
+        {"company_id": company_id},
+        {"stripe_subscription_id": 1, "subscription_tier": 1, "subscription_status": 1},
+    )
+    if _is_stale_subscription_event(current_doc, sub_id):
+        logger.warning(
+            "subscription.deleted.ignored_stale company_id=%s event_sub_id=%s stored_sub_id=%s",
+            company_id, sub_id, current_doc.get("stripe_subscription_id"),
+        )
         return
 
     now = datetime.now(timezone.utc)
