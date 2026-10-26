@@ -21,11 +21,11 @@ from config import settings
 from database import get_database
 
 
-async def require_company_access(
+async def _authenticate(
     company_id: str,
-    db: AsyncIOMotorDatabase = Depends(get_database),
-    authorization: str | None = Header(default=None, alias="Authorization"),
-) -> str:
+    db: AsyncIOMotorDatabase,
+    authorization: str | None,
+) -> dict:
     if not authorization:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
@@ -51,4 +51,30 @@ async def require_company_access(
     if user_id != company_id:
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Not allowed for this company")
 
+    return payload
+
+
+async def require_company_access(
+    company_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """Owner or team member of this company — for read-only status lookups the
+    dashboard needs everywhere (plan, trial, feature gating)."""
+    await _authenticate(company_id, db, authorization)
+    return company_id
+
+
+async def require_company_owner(
+    company_id: str,
+    db: AsyncIOMotorDatabase = Depends(get_database),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+) -> str:
+    """The account owner only — team members (whose token carries the owner's
+    id plus a `team_member` claim) can't see or change anything billing."""
+    claims = await _authenticate(company_id, db, authorization)
+    if claims.get("team_member"):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, detail="Billing is only available to the account owner",
+        )
     return company_id

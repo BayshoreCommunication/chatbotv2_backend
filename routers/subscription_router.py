@@ -26,7 +26,7 @@ from pydantic import BaseModel
 
 from config import settings
 from database import get_database
-from routers.company_auth import require_company_access
+from routers.company_auth import require_company_access, require_company_owner
 from model.subscription_model import GRACE_PERIOD_DAYS, SubscriptionResponse
 from services.subscription.subscription_service import (
     cancel_subscription,
@@ -96,7 +96,7 @@ def _raise_service_error(result: dict) -> None:
 
 @router.post(
     "/checkout/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Create a Stripe Checkout session for the given plan",
 )
 async def checkout(
@@ -120,7 +120,7 @@ async def checkout(
 
 @router.post(
     "/create/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Start a custom signup — returns a PaymentIntent client_secret for Stripe Elements",
 )
 async def create_subscription(
@@ -142,7 +142,7 @@ async def create_subscription(
 
 @router.post(
     "/change-plan/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Switch plan directly using the saved payment method (no Checkout redirect)",
 )
 async def change_plan(
@@ -164,7 +164,7 @@ async def change_plan(
 
 @router.post(
     "/retry-payment/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Get a client_secret to pay an open invoice (past_due 'Pay Now' button)",
 )
 async def retry_payment_route(
@@ -180,7 +180,7 @@ async def retry_payment_route(
 
 @router.post(
     "/portal/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Create a Stripe Customer Portal session (manage plan / payment)",
 )
 async def portal(
@@ -201,7 +201,7 @@ async def portal(
 
 @router.post(
     "/cancel/{company_id}",
-    dependencies=[Depends(require_company_access)],
+    dependencies=[Depends(require_company_owner)],
     summary="Cancel the company's subscription (default: at period end)",
 )
 async def cancel(
