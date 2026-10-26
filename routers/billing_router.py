@@ -18,6 +18,7 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
 from database import get_database
+from routers.company_auth import require_company_access
 from services import billing_service
 
 router = APIRouter(prefix="/billing", tags=["Billing"])
@@ -44,6 +45,7 @@ def _raise_service_error(result: dict) -> None:
 
 @router.get(
     "/payment-methods/{company_id}",
+    dependencies=[Depends(require_company_access)],
     summary="List saved payment methods (cards) for a company",
 )
 async def get_payment_methods(
@@ -57,6 +59,7 @@ async def get_payment_methods(
 
 @router.post(
     "/payment-methods/{company_id}/default",
+    dependencies=[Depends(require_company_access)],
     summary="Set a card as the default payment method",
 )
 async def set_default_payment_method(
@@ -73,6 +76,7 @@ async def set_default_payment_method(
 
 @router.delete(
     "/payment-methods/{company_id}/{payment_method_id}",
+    dependencies=[Depends(require_company_access)],
     status_code=status.HTTP_204_NO_CONTENT,
     summary="Remove a saved card",
 )
@@ -87,6 +91,7 @@ async def remove_payment_method(
 
 @router.post(
     "/setup-intent/{company_id}",
+    dependencies=[Depends(require_company_access)],
     summary="Create a SetupIntent so the frontend can collect a new card via Stripe Elements",
 )
 async def create_setup_intent(
@@ -102,6 +107,7 @@ async def create_setup_intent(
 
 @router.get(
     "/invoices/{company_id}",
+    dependencies=[Depends(require_company_access)],
     summary="Get payment/invoice history for a company",
 )
 async def get_invoices(
