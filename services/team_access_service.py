@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import random
+import re
 import secrets
 import string
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,8 @@ async def add_team_member(
     name: str,
     email: str,
 ) -> dict:
+    email = email.strip().lower()
+
     # Enforce member limit (exclude revoked)
     active_count = await db["team_access"].count_documents(
         {"owner_id": owner_id, "status": {"$ne": "revoked"}}
@@ -51,11 +54,21 @@ async def add_team_member(
         return {"error": "limit_reached", "detail": f"Maximum of {MAX_MEMBERS} team members reached."}
 
     # Block adding an email that belongs to a registered main user
-    main_user = await db["users"].find_one({"email": email}, {"_id": 1})
+    main_user = await db["users"].find_one(
+        {"email": {"$regex": f"^{re.escape(email)}$", "$options": "i"}}, {"_id": 1},
+    )
     if main_user:
         return {"error": "is_registered_user", "detail": "This email belongs to a registered account and cannot be added as a team member."}
 
     # No duplicate active/pending invite to same email under this owner
+    # An email can belong to one team only: sign-in has to know which
+    # account to open, so the same address on two teams would be ambiguous.
+    elsewhere = await db["team_access"].find_one(
+        {"owner_id": {"$ne": owner_id}, "email": email, "status": {"$nin": ["revoked"]}}, {"_id": 1},
+    )
+    if elsewhere:
+        return {"error": "already_exists", "detail": "This email is already a team member of another account."}
+
     existing = await db["team_access"].find_one(
         {"owner_id": owner_id, "email": email, "status": {"$nin": ["revoked"]}}
     )
@@ -106,12 +119,18 @@ async def verify_team_member(db: AsyncIOMotorDatabase, token: str) -> dict:
         return {"error": "invalid_token", "detail": "Invalid or expired verification link."}
     if member["status"] == "revoked":
         return {"error": "revoked", "detail": "This access has been revoked."}
+    if member["status"] == "inactive":
+        return {"error": "inactive", "detail": "Your access is currently disabled by the account owner."}
     if member["status"] == "active":
         return {"ok": True, "already_verified": True, "email": member["email"]}
 
+    # The token is kept (not cleared) so opening the link twice — a refresh,
+    # a mail scanner, dev double-render — still says "active" instead of
+    # "invalid link". Re-activation of a blocked member is prevented by the
+    # status checks above.
     await db["team_access"].update_one(
         {"_id": member["_id"]},
-        {"$set": {"status": "active", "verify_token": None, "updated_at": _now()}},
+        {"$set": {"status": "active", "updated_at": _now()}},
     )
     return {"ok": True, "already_verified": False, "email": member["email"]}
 
@@ -171,6 +190,7 @@ async def signin_team_member(db: AsyncIOMotorDatabase, email: str) -> dict:
     If the email belongs to an ACTIVE team member (email already verified),
     return the owner's full user document so the caller can issue a JWT.
     """
+    email  = email.strip().lower()
     member = await db["team_access"].find_one({"email": email, "status": "active"})
     if not member:
         # pending/inactive/revoked — not allowed
@@ -200,6 +220,7 @@ async def signin_team_member(db: AsyncIOMotorDatabase, email: str) -> dict:
 
 async def request_team_otp(db: AsyncIOMotorDatabase, email: str) -> dict:
     """Called from auth_service when a sign-in email is not in the users collection."""
+    email  = email.strip().lower()
     member = await db["team_access"].find_one({"email": email, "status": "active"})
     if not member:
         return {"error": "not_team_member"}
@@ -229,6 +250,7 @@ async def request_team_otp(db: AsyncIOMotorDatabase, email: str) -> dict:
 
 async def verify_team_otp(db: AsyncIOMotorDatabase, email: str, otp_code: str) -> dict:
     """Returns the OWNER's user data so the team member gets the owner's session."""
+    email  = email.strip().lower()
     member = await db["team_access"].find_one({"email": email, "status": "active"})
     if not member:
         return {"error": "not_team_member"}

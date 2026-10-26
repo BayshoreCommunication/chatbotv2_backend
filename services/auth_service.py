@@ -29,8 +29,14 @@ def _otp_matches(stored: str | None, given: str) -> bool:
     return bool(stored) and secrets.compare_digest(str(stored), str(given))
 
 
-def create_access_token(data: dict) -> str:
-    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+# Team-member tokens are short-lived on purpose: they carry the owner's id, so
+# the only point where a revoked/blocked member is re-checked is the refresh
+# call. Two days keeps worst-case access after a revoke small.
+TEAM_TOKEN_EXPIRE_MINUTES = 2 * 24 * 60
+
+
+def create_access_token(data: dict, minutes: int | None = None) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(minutes=minutes or settings.ACCESS_TOKEN_EXPIRE_MINUTES)
     return jwt.encode({**data, "exp": expire}, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
 
 
@@ -256,7 +262,7 @@ async def verify_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPVerifyRequ
             "team_member":    True,
             "team_email":     team_result["member_email"],
             "team_access_id": team_result["team_access_id"],
-        })
+        }, minutes=TEAM_TOKEN_EXPIRE_MINUTES)
         return {
             "access_token":          token,
             "token_type":            "bearer",
@@ -344,4 +350,5 @@ async def refresh_access_token(db: AsyncIOMotorDatabase, token: str) -> dict:
             return {"error": "invalid_token"}
 
     claims.pop("exp", None)
-    return {"access_token": create_access_token(claims), "token_type": "bearer"}
+    minutes = TEAM_TOKEN_EXPIRE_MINUTES if claims.get("team_member") else None
+    return {"access_token": create_access_token(claims, minutes=minutes), "token_type": "bearer"}

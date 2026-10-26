@@ -38,6 +38,12 @@ async def _get_owner(
     except JWTError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token")
 
+    # Team members hold a token for the owner's account, but managing who has
+    # access is the owner's job — otherwise a member could invite more people
+    # or revoke the rest of the team.
+    if payload.get("team_member"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the account owner can manage team access")
+
     user_id = payload.get("sub")
     if not ObjectId.is_valid(user_id):
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")
