@@ -681,6 +681,73 @@ async def create_checkout_session(
         return {"error": "stripe_error", "detail": str(e)}
 
 
+async def _void_open_upgrade_invoices(customer_id: str) -> None:
+    """Void unpaid plan-upgrade top-up invoices left behind by abandoned attempts."""
+    try:
+        open_invoices = stripe.Invoice.list(customer=customer_id, status="open", limit=20)
+    except stripe.StripeError:
+        logger.warning("subscription.upgrade.list_open_failed customer_id=%s", customer_id, exc_info=True)
+        return
+    for inv in open_invoices.data:
+        if _read_metadata(inv).get("kind") != "plan_upgrade":
+            continue
+        try:
+            stripe.Invoice.void_invoice(inv.id)
+            logger.info("subscription.upgrade.stale_invoice_voided invoice_id=%s", inv.id)
+        except stripe.StripeError:
+            logger.warning("subscription.upgrade.void_failed invoice_id=%s", inv.id, exc_info=True)
+
+
+async def _apply_plan_upgrade(db: AsyncIOMotorDatabase, invoice: Any) -> None:
+    """Switch the subscription to the upgraded price once its top-up invoice
+    is paid. Safe to call from both the immediate-pay path and the
+    invoice.payment_succeeded webhook — an atomic claim on the invoice id
+    makes the second call a no-op."""
+    meta       = _read_metadata(invoice)
+    sub_id     = meta.get("subscription_id")
+    price_id   = meta.get("price_id")
+    company_id = meta.get("company_id")
+    tier       = meta.get("tier")
+    cycle      = meta.get("billing_cycle") or "monthly"
+    invoice_id = getattr(invoice, "id", None)
+    if not (sub_id and price_id and company_id and tier and invoice_id):
+        logger.warning("subscription.upgrade.apply.missing_metadata invoice_id=%s meta=%s", invoice_id, meta)
+        return
+
+    claimed = await db["subscriptions"].find_one_and_update(
+        {"company_id": company_id, "last_upgrade_invoice_id": {"$ne": invoice_id}},
+        {"$set": {"last_upgrade_invoice_id": invoice_id}},
+    )
+    if not claimed:
+        logger.info("subscription.upgrade.apply.already_done invoice_id=%s", invoice_id)
+        return
+
+    try:
+        sub     = stripe.Subscription.retrieve(sub_id)
+        item_id = sub["items"]["data"][0]["id"]
+        stripe.Subscription.modify(
+            sub_id,
+            items=[{"id": item_id, "price": price_id}],
+            proration_behavior="none",   # billing_cycle_anchor left unset — renewal date unchanged
+            metadata={"company_id": company_id, "tier": tier, "billing_cycle": cycle},
+        )
+    except stripe.StripeError:
+        # Let a later webhook retry take another go.
+        await db["subscriptions"].update_one(
+            {"company_id": company_id}, {"$set": {"last_upgrade_invoice_id": None}},
+        )
+        logger.exception("subscription.upgrade.apply.failed invoice_id=%s sub_id=%s", invoice_id, sub_id)
+        return
+
+    await _notify_plan_changed(
+        db, company_id, tier, cycle,
+        (getattr(invoice, "amount_paid", 0) or 0) / 100,
+        getattr(invoice, "currency", "usd") or "usd",
+        scheduled=False, effective_at=None,
+    )
+    logger.info("subscription.upgrade.apply.done company_id=%s tier=%s invoice_id=%s", company_id, tier, invoice_id)
+
+
 async def change_subscription_plan(
     db: AsyncIOMotorDatabase,
     company_id: str,
@@ -809,45 +876,78 @@ async def change_subscription_plan(
         new_amount     = stripe.Price.retrieve(price_id).unit_amount or 0
 
         if new_amount > current_amount:
-            # ── Upgrade: flat top-up ────────────────────────────────────────
-            stripe.Subscription.modify(
-                sub_id,
-                items=[{"id": item_id, "price": price_id}],
-                proration_behavior="none",   # billing_cycle_anchor intentionally
-                metadata=base_metadata,      # left unset — keeps the renewal date.
+            # ── Upgrade: flat top-up — pay FIRST, switch plan after ─────────
+            # The plan is only changed once the top-up invoice is actually
+            # paid (immediately below if the saved card works, otherwise from
+            # the invoice.payment_succeeded webhook). A declined or abandoned
+            # payment therefore never leaves the customer on the higher plan.
+            diff     = new_amount - current_amount
+            customer = existing["stripe_customer_id"]
+            currency = getattr(sub, "currency", "usd") or "usd"
+
+            # Void any earlier upgrade invoice the customer never paid.
+            await _void_open_upgrade_invoices(customer)
+
+            # Standalone invoice (not linked to the subscription) so a failed
+            # top-up can never push the subscription itself into past_due.
+            invoice = stripe.Invoice.create(
+                customer=customer,
+                auto_advance=False,
+                pending_invoice_items_behavior="exclude",
+                metadata={
+                    **base_metadata,
+                    "kind":            "plan_upgrade",
+                    "subscription_id": sub_id,
+                    "price_id":        price_id,
+                },
             )
             stripe.InvoiceItem.create(
-                customer=existing["stripe_customer_id"],
-                subscription=sub_id,
-                amount=new_amount - current_amount,
-                currency=getattr(sub, "currency", "usd") or "usd",
+                customer=customer,
+                invoice=invoice.id,
+                amount=diff,
+                currency=currency,
                 description=f"Upgrade to {tier.title()}",
             )
-            invoice = stripe.Invoice.create(
-                customer=existing["stripe_customer_id"],
-                subscription=sub_id,
-                pending_invoice_items_behavior="include",
-            )
-            invoice = stripe.Invoice.finalize_invoice(invoice.id, expand=["confirmation_secret"])
+            invoice = stripe.Invoice.finalize_invoice(invoice.id)
+
+            paid = False
+            try:
+                invoice = stripe.Invoice.pay(invoice.id, expand=["confirmation_secret"])
+                paid = getattr(invoice, "status", None) == "paid"
+            except stripe.StripeError as pay_err:
+                logger.info(
+                    "subscription.change_plan.upgrade_needs_confirmation company_id=%s error=%s",
+                    company_id, pay_err,
+                )
+
+            if paid:
+                await _apply_plan_upgrade(db, invoice)
+                logger.info(
+                    "subscription.change_plan.ok(upgrade) company_id=%s tier=%s cycle=%s sub_id=%s diff=%s paid=true",
+                    company_id, tier, billing_cycle, sub_id, diff,
+                )
+                return {"ok": True, "requires_payment": False, "client_secret": None, "intent_kind": None}
+
+            invoice = stripe.Invoice.retrieve(invoice.id, expand=["confirmation_secret"])
             client_secret, intent_kind, requires_payment = _extract_payment_confirmation(invoice)
+            if not requires_payment:
+                # Nothing to confirm and not paid — don't leave it dangling.
+                try:
+                    stripe.Invoice.void_invoice(invoice.id)
+                except stripe.StripeError:
+                    logger.warning("subscription.change_plan.upgrade_void_failed invoice_id=%s", invoice.id, exc_info=True)
+                return {"error": "payment_failed", "detail": "Could not charge your card. Please add a payment method and try again."}
 
             logger.info(
-                "subscription.change_plan.ok(upgrade) company_id=%s tier=%s cycle=%s sub_id=%s "
-                "diff=%s requires_payment=%s intent_kind=%s",
-                company_id, tier, billing_cycle, sub_id, new_amount - current_amount, requires_payment, intent_kind,
+                "subscription.change_plan.ok(upgrade) company_id=%s tier=%s cycle=%s sub_id=%s diff=%s "
+                "requires_payment=true intent_kind=%s",
+                company_id, tier, billing_cycle, sub_id, diff, intent_kind,
             )
-            if not requires_payment:
-                await _notify_plan_changed(
-                    db, company_id, tier, billing_cycle,
-                    (getattr(invoice, "amount_paid", 0) or 0) / 100,
-                    getattr(invoice, "currency", "usd") or "usd",
-                    scheduled=False, effective_at=None,
-                )
             return {
                 "ok": True,
-                "requires_payment": requires_payment,
-                "client_secret": client_secret if requires_payment else None,
-                "intent_kind": intent_kind if requires_payment else None,
+                "requires_payment": True,
+                "client_secret": client_secret,
+                "intent_kind": intent_kind,
             }
 
         if new_amount < current_amount:
@@ -1407,6 +1507,11 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
 
 
 async def _on_payment_succeeded(db: AsyncIOMotorDatabase, invoice: Any) -> None:
+    if _read_metadata(invoice).get("kind") == "plan_upgrade":
+        # Standalone top-up invoice (see change_subscription_plan) — the only
+        # thing to do is switch the plan now that it's paid.
+        await _apply_plan_upgrade(db, invoice)
+        return
     sub_id = getattr(invoice, "subscription", None)
     logger.info("payment.succeeded invoice_id=%s sub_id=%s", getattr(invoice, "id", "?"), sub_id)
     if not sub_id:
