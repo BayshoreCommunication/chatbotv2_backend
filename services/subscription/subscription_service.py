@@ -1374,7 +1374,11 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
     await db["users"].update_one(
         {"_id": user_oid},
         {"$set": {
-            "is_subscribed":         False,
+            # is_subscribed deliberately stays as-is: it only gates the
+            # dashboard, and a company whose subscription ended (Stripe
+            # cancels after its retries run out) must still reach the
+            # dashboard/billing to pay and resume. The chatbot is what
+            # actually stops, via chatbot_overdue below.
             "has_paid_subscription": False,
             "subscription_type":     "free",
             "subscription_end_date": now,
