@@ -39,3 +39,7 @@ htmlcov/
 dist/
 build/
 *.egg-info/
+
+# Never commit private keys
+*.pem
+*.key
