@@ -408,9 +408,16 @@ async def _sync_users_doc(
     }
     if period_start:
         fields["subscription_start_date"] = period_start
+    # A live paid/trial subscription always means the chatbot is allowed to
+    # answer again (undoes the block set by _on_subscription_deleted or the
+    # overdue cutoff).
+    if status in ("active", "trialing"):
+        fields["chatbot_overdue"] = False
 
     user_oid = _to_object_id(company_id)
     result = await db["users"].update_one({"_id": user_oid}, {"$set": fields})
+    if status in ("active", "trialing"):
+        invalidate_context(company_id)
     logger.info(
         "subscription.sync_user company_id=%s status=%s tier=%s matched=%s",
         company_id, status, tier, result.matched_count,
@@ -1371,9 +1378,14 @@ async def _on_subscription_deleted(db: AsyncIOMotorDatabase, sub: Any) -> None:
             "has_paid_subscription": False,
             "subscription_type":     "free",
             "subscription_end_date": now,
+            # Subscription is gone (trial ended with no card, or cancelled
+            # period ran out) — stop the chatbot answering visitors. The
+            # dashboard/billing stay reachable so they can pay and resume.
+            "chatbot_overdue":       True,
             "updated_at":            now,
         }},
     )
+    invalidate_context(company_id)
     await notification_service.create_subscription_canceled_notification(db, company_id)
 
     # Best-effort — same reasoning as the confirmation email: don't let a
