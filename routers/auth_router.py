@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, Header, HTTPException, status, Depends
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from database import get_database
@@ -90,4 +90,20 @@ async def verify_login_otp(payload: LoginOTPVerifyRequest, db: AsyncIOMotorDatab
     """
     result = await auth_service.verify_login_otp(db, payload)
     raise_if_error(result)
+    return result
+
+
+@router.post("/refresh", summary="Swap a valid token for a fresh one (sliding session)")
+async def refresh_token(
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    db: AsyncIOMotorDatabase = Depends(get_database),
+):
+    token = (authorization or "").strip()
+    if token.lower().startswith("bearer "):
+        token = token.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+    result = await auth_service.refresh_access_token(db, token)
+    if result.get("error"):
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
     return result

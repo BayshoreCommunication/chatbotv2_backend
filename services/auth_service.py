@@ -310,3 +310,38 @@ async def verify_login_otp(db: AsyncIOMotorDatabase, payload: LoginOTPVerifyRequ
         "has_paid_subscription": bool(user.get("has_paid_subscription", False)),
         "subscription_type":  user.get("subscription_type", "free"),
     }
+
+
+# ── Sliding session: swap a still-valid token for a fresh one ────────────────
+
+async def refresh_access_token(db: AsyncIOMotorDatabase, token: str) -> dict:
+    """Exchange a still-valid access token for a new one with a fresh expiry.
+
+    The dashboard calls this while a user is actively using it, so the session
+    keeps sliding forward and only a full ACCESS_TOKEN_EXPIRE_MINUTES of
+    inactivity signs them out. An expired or tampered token is rejected, as is
+    one whose user was disabled or whose team access was revoked.
+    """
+    try:
+        claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    except Exception:
+        return {"error": "invalid_token"}
+
+    user_id = claims.get("sub")
+    if not isinstance(user_id, str) or not ObjectId.is_valid(user_id):
+        return {"error": "invalid_token"}
+
+    user = await db["users"].find_one({"_id": ObjectId(user_id), "is_active": True}, {"_id": 1})
+    if not user:
+        return {"error": "invalid_token"}
+
+    if claims.get("team_member"):
+        team_id = claims.get("team_access_id")
+        if not team_id or not ObjectId.is_valid(str(team_id)):
+            return {"error": "invalid_token"}
+        member = await db["team_access"].find_one({"_id": ObjectId(str(team_id)), "status": "active"}, {"_id": 1})
+        if not member:
+            return {"error": "invalid_token"}
+
+    claims.pop("exp", None)
+    return {"access_token": create_access_token(claims), "token_type": "bearer"}
