@@ -48,6 +48,22 @@ def _serialize_settings(doc: dict[str, Any] | None) -> CalendlySettings:
     )
 
 
+TOKEN_MASK = "••••••••"
+
+
+def mask_settings(settings: CalendlySettings) -> CalendlySettings:
+    """Copy of the settings that's safe to send to the browser — the real
+    Calendly token never leaves the server, only a placeholder if one is saved."""
+    masked = settings.model_copy()
+    masked.calendly_access_token = TOKEN_MASK if settings.calendly_access_token.strip() else ""
+    return masked
+
+
+async def get_webhook_error(db: AsyncIOMotorDatabase, user_id: str) -> str | None:
+    doc = await db[SETTINGS_COLLECTION].find_one({"user_id": user_id}, {"calendly_webhook_error": 1})
+    return (doc or {}).get("calendly_webhook_error") or None
+
+
 async def get_user_calendly_settings(db: AsyncIOMotorDatabase, user_id: str) -> CalendlySettings:
     doc = await db[SETTINGS_COLLECTION].find_one({"user_id": user_id})
     return _serialize_settings(doc)
@@ -246,6 +262,44 @@ async def _calendly_post(access_token: str, path: str, json_body: dict[str, Any]
     return resp.json()
 
 
+async def _calendly_delete(access_token: str, path: str) -> None:
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.delete(f"{CALENDLY_BASE_URL}{path}", headers=headers)
+    # 404 = already gone, which is the outcome we wanted anyway.
+    if resp.status_code >= 400 and resp.status_code != 404:
+        raise CalendlyAPIError(f"Calendly API error: {resp.status_code} — {resp.text[:200]}")
+
+
+async def _set_webhook_error(db: AsyncIOMotorDatabase, user_id: str, message: str | None) -> None:
+    await db[SETTINGS_COLLECTION].update_one(
+        {"user_id": user_id},
+        {"$set": {"calendly_webhook_error": message, "updated_at": datetime.now(timezone.utc)}},
+    )
+
+
+async def remove_calendly_webhook(db: AsyncIOMotorDatabase, user_id: str) -> None:
+    """Delete this company's webhook subscription at Calendly (best effort).
+
+    Called before the saved token/settings are wiped. Without it the old
+    subscription outlives our stored signing key, and a later reconnect finds
+    it "already registered" with no key to verify payloads — so booking
+    tracking would silently never work again.
+    """
+    doc = await db[SETTINGS_COLLECTION].find_one(
+        {"user_id": user_id}, {"calendly_access_token": 1, "calendly_webhook_uri": 1},
+    )
+    token = (doc or {}).get("calendly_access_token", "")
+    webhook_uri = (doc or {}).get("calendly_webhook_uri", "")
+    if not token or not webhook_uri:
+        return
+    try:
+        await _calendly_delete(token, webhook_uri.replace(CALENDLY_BASE_URL, ""))
+        logger.info("calendly.webhook.removed user_id=%s uri=%s", user_id, webhook_uri)
+    except Exception as exc:
+        logger.warning("calendly.webhook.remove_failed user_id=%s error=%s", user_id, exc)
+
+
 async def ensure_calendly_webhook(
     db: AsyncIOMotorDatabase,
     user_id: str,
@@ -269,6 +323,7 @@ async def ensure_calendly_webhook(
             "(set BACKEND_PUBLIC_URL to enable real-booking tracking)",
             user_id,
         )
+        await _set_webhook_error(db, user_id, "Booking tracking isn't available right now. Slots still work.")
         return
 
     try:
@@ -284,12 +339,20 @@ async def ensure_calendly_webhook(
             "/webhook_subscriptions",
             params={"organization": org_uri, "user": user_uri, "scope": "user", "count": 100},
         )
+        have_key = bool(await get_webhook_signing_key(db, user_id))
         for item in existing.get("collection", []):
             if isinstance(item, dict) and item.get("callback_url") == callback_url:
-                # Already registered for this exact URL — nothing to do. The
-                # signing key from creation time is still stored from before.
-                logger.info("calendly.webhook.already_registered user_id=%s uri=%s", user_id, item.get("uri"))
-                return
+                if have_key:
+                    # Already registered and we still hold its signing key.
+                    logger.info("calendly.webhook.already_registered user_id=%s uri=%s", user_id, item.get("uri"))
+                    await _set_webhook_error(db, user_id, None)
+                    return
+                # Registered, but the signing key was lost (settings were
+                # removed earlier). Calendly only reveals a key on creation,
+                # so replace the subscription to get a fresh one.
+                old_uri = str(item.get("uri", ""))
+                logger.warning("calendly.webhook.replacing_keyless user_id=%s uri=%s", user_id, old_uri)
+                await _calendly_delete(access_token, old_uri.replace(CALENDLY_BASE_URL, ""))
 
         created = await _calendly_post(
             access_token,
@@ -317,11 +380,19 @@ async def ensure_calendly_webhook(
                 "updated_at": datetime.now(timezone.utc),
             }},
         )
+        await _set_webhook_error(db, user_id, None)
         logger.info("calendly.webhook.created user_id=%s uri=%s", user_id, webhook_uri)
     except CalendlyAPIError as exc:
         logger.error("calendly.webhook.setup_failed user_id=%s error=%s", user_id, exc)
+        # Typically a free Calendly plan (webhooks need Standard or higher).
+        await _set_webhook_error(
+            db, user_id,
+            "Calendly couldn't turn on booking tracking (this needs a paid Calendly plan). "
+            "Appointment slots still work, but completed bookings won't be recorded automatically.",
+        )
     except Exception as exc:
         logger.exception("calendly.webhook.setup_unexpected_error user_id=%s error=%s", user_id, exc)
+        await _set_webhook_error(db, user_id, "Booking tracking couldn't be set up. Slots still work.")
 
 
 def verify_calendly_webhook_signature(

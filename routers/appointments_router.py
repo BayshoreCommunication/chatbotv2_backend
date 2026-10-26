@@ -28,13 +28,16 @@ from services.appointments import (
     get_calendly_events,
     get_calendly_stats,
     get_user_calendly_settings,
+    get_webhook_error,
     get_webhook_signing_key,
+    mask_settings,
     record_appointment_from_webhook,
+    remove_calendly_webhook,
     save_user_calendly_settings,
     test_calendly_connection,
     verify_calendly_webhook_signature,
 )
-from services.appointments.service import CalendlyAPIError
+from services.appointments.service import TOKEN_MASK, CalendlyAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -59,10 +62,11 @@ async def _build_snapshot(
 ) -> dict[str, Any]:
     settings_doc = await get_user_calendly_settings(db, user_id)
     token = settings_doc.calendly_access_token.strip()
+    safe_settings = mask_settings(settings_doc).model_dump()
 
     if not token:
         return {
-            "settings": settings_doc.model_dump(),
+            "settings": safe_settings,
             "token_configured": False,
             "connected": False,
             "events": [],
@@ -75,7 +79,7 @@ async def _build_snapshot(
         valid = await test_calendly_connection(token)
         if not valid:
             return {
-                "settings": settings_doc.model_dump(),
+                "settings": safe_settings,
                 "token_configured": True,
                 "connected": False,
                 "events": [],
@@ -91,17 +95,18 @@ async def _build_snapshot(
             slots = await get_calendly_availability(token, settings_doc.event_type_uri)
 
         return {
-            "settings": settings_doc.model_dump(),
+            "settings": safe_settings,
             "token_configured": True,
             "connected": True,
             "events": [event.model_dump() for event in events],
             "stats": stats_data.model_dump(),
             "slots": [slot.model_dump() for slot in slots],
             "error": None,
+            "warning": await get_webhook_error(db, user_id),
         }
     except CalendlyAPIError as exc:
         return {
-            "settings": settings_doc.model_dump(),
+            "settings": safe_settings,
             "token_configured": True,
             "connected": False,
             "events": [],
@@ -190,6 +195,7 @@ async def delete_token(
     db: AsyncIOMotorDatabase = Depends(get_database),
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
+    await remove_calendly_webhook(db, current_user["id"])
     await delete_user_calendly_settings(db, current_user["id"])
     return await _build_snapshot(db, current_user["id"])
 
@@ -220,7 +226,7 @@ async def get_settings(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     settings_doc = await get_user_calendly_settings(db, current_user["id"])
-    return CalendlySettingsResponse(settings=settings_doc)
+    return CalendlySettingsResponse(settings=mask_settings(settings_doc))
 
 
 @router.post("/calendly/settings")
@@ -230,8 +236,13 @@ async def save_settings(
     current_user: dict[str, Any] = Depends(get_current_user),
 ):
     if not payload.calendly_access_token.strip():
+        await remove_calendly_webhook(db, current_user["id"])
         await delete_user_calendly_settings(db, current_user["id"])
         return {"ok": True}
+    if payload.calendly_access_token == TOKEN_MASK:
+        # The browser only ever sees a placeholder — keep the stored token.
+        current = await get_user_calendly_settings(db, current_user["id"])
+        payload = payload.model_copy(update={"calendly_access_token": current.calendly_access_token})
     await save_user_calendly_settings(db, current_user["id"], payload)
     return {"ok": True}
 
