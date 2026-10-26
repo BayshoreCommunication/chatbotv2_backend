@@ -269,6 +269,10 @@ async def remove_payment_method(
                 "error": "default_payment_method",
                 "detail": "Set another card as default before removing this one.",
             }
+        pm = stripe.PaymentMethod.retrieve(payment_method_id)
+        if getattr(pm, "customer", None) != customer_id:
+            # Never detach a card that belongs to another company's customer.
+            return {"error": "no_subscription", "detail": "Payment method not found."}
         stripe.PaymentMethod.detach(payment_method_id)
         logger.info(
             "billing.payment_methods.removed company_id=%s payment_method_id=%s",
