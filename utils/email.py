@@ -540,3 +540,71 @@ async def send_visitor_limit_reached_email(to_email: str, company_name: str) -> 
         )
         if response.status_code >= 400:
             raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")
+
+
+async def send_new_lead_email(
+    to_email: str,
+    company_name: str,
+    lead_name: str | None,
+    lead_email: str | None,
+    lead_phone: str | None,
+    lead_message: str | None,
+    created_at: datetime | None,
+    lead_id: str,
+) -> None:
+    """Notify the account owner that their chatbot captured a new lead —
+    same fields the dashboard's Leads page shows."""
+    from html import escape
+
+    def cell(value: str | None) -> str:
+        # Lead fields come from website visitors, so escape before putting in HTML.
+        return escape(value) if value else '<span style="color:#9ca3af;">N/A</span>'
+
+    subject = f"New lead: {lead_name or lead_email or lead_phone or 'New visitor'}"
+    leads_link = f"{settings.FRONTEND_URL}/leads?leadId={lead_id}"
+    date_label = created_at.strftime("%b %d, %Y %I:%M %p UTC") if created_at else "N/A"
+
+    rows = [
+        ("Name", cell(lead_name)),
+        ("Email", cell(lead_email)),
+        ("Phone", cell(lead_phone)),
+        ("Inquiry", cell(lead_message)),
+        ("Date", escape(date_label)),
+    ]
+    rows_html = "".join(
+        f'<tr><td style="padding:8px 12px;color:#6b7280;font-size:13px;width:90px;vertical-align:top;">{label}</td>'
+        f'<td style="padding:8px 12px;color:#111827;font-size:14px;white-space:pre-wrap;">{value}</td></tr>'
+        for label, value in rows
+    )
+
+    html_body = f"""
+    <div style="font-family:Arial,sans-serif;max-width:480px;margin:auto;padding:32px;border:1px solid #e5e7eb;border-radius:8px;">
+        <h2 style="color:#1f2937;margin-bottom:4px;">You have a new lead</h2>
+        <p style="color:#6b7280;margin-bottom:24px;">Hi <strong>{escape(company_name)}</strong>, your AI assistant just captured a new visitor's contact details.</p>
+
+        <table style="width:100%;border-collapse:collapse;background:#f9fafb;border-radius:8px;margin-bottom:24px;">
+            {rows_html}
+        </table>
+
+        <a href="{leads_link}"
+           style="display:inline-block;background:#111827;color:#fff;text-decoration:none;padding:12px 24px;border-radius:8px;font-size:14px;font-weight:600;">
+            View in Dashboard
+        </a>
+        <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
+        <p style="color:#9ca3af;font-size:12px;">You're receiving this because your chatbot captured a lead.</p>
+    </div>
+    """
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            RESEND_API_URL,
+            headers={"Authorization": f"Bearer {settings.RESEND_API_KEY}"},
+            json={
+                "from": settings.RESEND_FROM_EMAIL,
+                "to": [to_email],
+                "subject": subject,
+                "html": html_body,
+            },
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Resend API error {response.status_code}: {response.text}")

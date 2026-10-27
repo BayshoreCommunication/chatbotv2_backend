@@ -29,6 +29,74 @@ def serialize_lead(lead: dict) -> dict:
         "updated_at": lead.get("updated_at"),
     }
 
+def _has(field: str) -> dict:
+    return {field: {"$exists": True, "$nin": [None, ""]}}
+
+
+# A lead is worth emailing only with at least two of name / email / phone:
+# name+email, name+phone, or email+phone. A lone name or lone phone isn't enough.
+_EMAILABLE_LEAD = {"$or": [
+    {**_has("name"), **_has("email")},
+    {**_has("name"), **_has("phone")},
+    {**_has("email"), **_has("phone")},
+]}
+
+
+async def maybe_email_owner_new_lead(
+    db: AsyncIOMotorDatabase, company_id: str, session_id: str,
+) -> None:
+    """Email the lead to the account owner's signup email — once per lead, the
+    first time it has at least two of name / email / phone. Safe to call on
+    every lead update. Never raises — a failed email must not affect the chat."""
+    from utils.email import send_new_lead_email
+
+    try:
+        if not ObjectId.is_valid(company_id):
+            return
+
+        # Atomically claim the "email sent" flag so two quick chat turns
+        # can't both send it.
+        lead = await db["leads"].find_one_and_update(
+            {
+                "company_id": company_id,
+                "session_id": session_id,
+                "owner_email_sent": {"$ne": True},
+                **_EMAILABLE_LEAD,
+            },
+            {"$set": {"owner_email_sent": True}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not lead:
+            return  # not complete enough yet, or already emailed
+
+        owner = await db["users"].find_one(
+            {"_id": ObjectId(company_id)}, {"email": 1, "company_name": 1},
+        )
+        if not owner or not owner.get("email"):
+            return
+
+        try:
+            await send_new_lead_email(
+                to_email=owner["email"],
+                company_name=owner.get("company_name") or "there",
+                lead_name=lead.get("name"),
+                lead_email=lead.get("email"),
+                lead_phone=lead.get("phone"),
+                lead_message=lead.get("message"),
+                created_at=lead.get("created_at"),
+                lead_id=str(lead["_id"]),
+            )
+        except Exception:
+            # Release the flag so the next chat turn retries the email.
+            await db["leads"].update_one(
+                {"_id": lead["_id"]}, {"$set": {"owner_email_sent": False}},
+            )
+            raise
+        logger.info("lead.email_sent company_id=%s lead_id=%s", company_id, lead["_id"])
+    except Exception:
+        logger.warning("lead.email_failed company_id=%s", company_id, exc_info=True)
+
+
 async def get_leads_by_company(db: AsyncIOMotorDatabase, company_id: str) -> List[dict]:
     """Fetch all leads for a specific company, sorted by newest first."""
     cursor = db["leads"].find({"company_id": company_id}).sort("created_at", -1)

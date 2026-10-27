@@ -10,6 +10,7 @@ Endpoints:
 """
 
 from __future__ import annotations
+import asyncio
 import logging
 import time
 from datetime import datetime, timezone
@@ -22,7 +23,7 @@ from pymongo import ReturnDocument
 
 from config import settings
 from database import get_database
-from services import notification_service
+from services import lead_service, notification_service
 from services.chatbot import (
     build_company_agent,
     get_cached_tool_names,
@@ -42,6 +43,9 @@ from services.subscription.subscription_service import check_and_count_visitor
 router = APIRouter(prefix="/chat", tags=["Chat"])
 widget_router = APIRouter(prefix="/chatbot", tags=["Widget Chat"])
 logger = logging.getLogger(__name__)
+
+# Holds references to fire-and-forget tasks so they aren't garbage-collected mid-run.
+_background_tasks: set[asyncio.Task] = set()
 
 # Shown to end visitors for ANY failure that isn't their fault — billing
 # overdue, usage cap hit, or a genuine technical failure (LLM provider error,
@@ -845,6 +849,15 @@ async def _persist_exchange(
                         new_lead.get("name"),
                         new_lead.get("email") or new_lead.get("phone"),
                     )
+
+            # Email the lead to the account owner once it has at least two of
+            # name / email / phone (checked on every update, sent only once).
+            # Runs in the background so the chat reply isn't delayed.
+            task = asyncio.create_task(
+                lead_service.maybe_email_owner_new_lead(db, company_id, session_id)
+            )
+            _background_tasks.add(task)
+            task.add_done_callback(_background_tasks.discard)
 
     except Exception as exc:
         # Never let a persistence failure break the chat reply
