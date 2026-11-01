@@ -345,9 +345,37 @@ async def _fetch_page_contact_info(page_id: str, page_access_token: str) -> dict
         return {}
     body = resp.json()
     return {
-        "whatsapp_number": str(body.get("whatsapp_number") or ""),
+        # Most Pages show WhatsApp as their action button rather than
+        # filling the whatsapp_number field, so fall back to that.
+        "whatsapp_number": str(body.get("whatsapp_number") or "")
+        or await _fetch_whatsapp_action_button_number(page_id, page_access_token),
         "website": str(body.get("website") or ""),
     }
+
+
+async def _fetch_whatsapp_action_button_number(page_id: str, page_access_token: str) -> str:
+    """The number behind the Page's "WhatsApp" action button, if it has one.
+    Best-effort like _fetch_page_contact_info — returns "" on any failure."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE_URL}/{page_id}/call_to_actions",
+                headers={"Authorization": f"Bearer {page_access_token}"},
+                params={"fields": "type,intl_number_with_plus"},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("channel_oauth.page_cta_lookup_failed page_id=%s error=%s", page_id, exc)
+        return ""
+    if resp.status_code >= 400:
+        logger.warning(
+            "channel_oauth.page_cta_lookup_failed page_id=%s status=%d body=%s",
+            page_id, resp.status_code, resp.text,
+        )
+        return ""
+    for cta in resp.json().get("data", []):
+        if "WHATSAPP" in str(cta.get("type", "")).upper() and cta.get("intl_number_with_plus"):
+            return str(cta["intl_number_with_plus"])
+    return ""
 
 
 # ── Graph API: subscribe / unsubscribe a Page's webhook ─────────────────────
