@@ -37,7 +37,16 @@ from services.chatbot.session_cache import (
     update_session_lead,
 )
 from services.chatbot.tools import build_tools
+from services.chatbot.live_chat import (
+    is_human_takeover,
+    notify_ai_reply,
+    notify_ai_typing,
+    notify_visitor_message,
+    save_visitor_message,
+)
 from services.chatbot.ws_manager import ws_manager
+from model.apps_integration_model import ChannelType
+from services.apps_integration import MetaSendError, send_owner_reply_to_channel
 from services.subscription.subscription_service import check_and_count_visitor
 
 router = APIRouter(prefix="/chat", tags=["Chat"])
@@ -71,6 +80,12 @@ async def _require_dashboard_auth(
     token = authorization.strip()
     if token.lower().startswith("bearer "):
         token = token.split(" ", 1)[1].strip()
+    return await _company_id_from_token(token)
+
+
+async def _company_id_from_token(token: str) -> str:
+    """Shared by the HTTP endpoints above and the dashboard websocket, which
+    can't send an Authorization header and passes the token as ?token=."""
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
@@ -90,7 +105,22 @@ async def _require_dashboard_auth(
 # ── WebSocket: dashboard owner ────────────────────────────────────────────────
 
 @router.websocket("/{company_id}/ws")
-async def dashboard_ws(company_id: str, websocket: WebSocket):
+async def dashboard_ws(
+    company_id: str,
+    websocket: WebSocket,
+    token: str = Query(default=""),
+):
+    # Every live visitor message for this company flows through this socket,
+    # and company_id is public (it's in the widget's API key) — so only a
+    # signed-in owner/team member of this company may listen.
+    try:
+        auth_company_id = await _company_id_from_token(token)
+    except HTTPException:
+        auth_company_id = None
+    if auth_company_id != company_id:
+        await websocket.close(code=4401)
+        return
+
     await ws_manager.connect_dashboard(company_id, websocket)
     try:
         while True:
@@ -118,7 +148,7 @@ async def widget_ws(
         while True:
             await websocket.receive_text()  # keep-alive pings from widget
     except WebSocketDisconnect:
-        ws_manager.disconnect_widget(session_key)
+        ws_manager.disconnect_widget(session_key, websocket)
 
 
 # ── Takeover: toggle ──────────────────────────────────────────────────────────
@@ -169,6 +199,30 @@ async def owner_reply(
     if not payload.content.strip():
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Reply cannot be empty.")
     db = get_database()
+
+    # Messenger / Instagram / WhatsApp conversations: deliver through Meta
+    # first, and only save the reply once Meta has accepted it, so the
+    # dashboard never shows a message the customer didn't get. Widget
+    # conversations (no channel stored) are delivered over the widget
+    # websocket below.
+    session_doc = await db["chat_sessions"].find_one(
+        {"company_id": company_id, "session_id": session_id},
+        {"channel": 1, "channel_external_id": 1},
+    ) or {}
+    channel = session_doc.get("channel")
+    if channel in {c.value for c in ChannelType}:
+        try:
+            await send_owner_reply_to_channel(
+                db, company_id, ChannelType(channel), str(session_doc.get("channel_external_id") or ""),
+                session_id, payload.content.strip(),
+            )
+        except MetaSendError as exc:
+            logger.warning(
+                "chat.owner_reply.channel_send_failed company_id=%s session_id=%s channel=%s error=%s",
+                company_id, session_id, channel, exc,
+            )
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
     now = datetime.now(timezone.utc)
     msg = {
         "role": "assistant",
@@ -240,6 +294,9 @@ class ConversationHistoryItem(BaseModel):
     updated_at: datetime | None = None
     tools_used_history: list[list[str]]
     messages: list[HistoryMessage]
+    # "messenger" / "instagram" / "whatsapp"; None for website-widget chats.
+    channel: str | None = None
+    human_takeover: bool = False
 
 
 class ConversationHistoryResponse(BaseModel):
@@ -651,6 +708,8 @@ async def conversation_history(
                 updated_at=doc.get("updated_at"),
                 tools_used_history=tools_used_history,
                 messages=messages,
+                channel=doc.get("channel"),
+                human_takeover=bool(doc.get("human_takeover", False)),
             )
         )
 
@@ -999,37 +1058,13 @@ async def widget_ask(
     try:
         # Check human takeover — if active, store user message silently and return empty answer
         db = get_database()
-        session_doc = await db["chat_sessions"].find_one(
-            {"company_id": company_id, "session_id": session_id},
-            {"human_takeover": 1},
-        )
-        if session_doc and session_doc.get("human_takeover"):
-            now = datetime.now(timezone.utc)
-            await db["chat_sessions"].update_one(
-                {"company_id": company_id, "session_id": session_id},
-                {
-                    "$push": {"messages": {"role": "user", "content": payload.message, "timestamp": now}},
-                    "$set": {"updated_at": now},
-                },
-            )
-            await ws_manager.notify_dashboard(company_id, {
-                "type": "new_message",
-                "session_id": session_id,
-                "content": payload.message,
-                "timestamp": now.isoformat(),
-            })
+        if await is_human_takeover(db, company_id, session_id):
+            timestamp = await save_visitor_message(db, company_id, session_id, payload.message)
+            await notify_visitor_message(company_id, session_id, payload.message, "widget", timestamp)
             return WidgetChatResponse(answer="", session_id=session_id, company_id=company_id)
 
-        await ws_manager.notify_dashboard(company_id, {
-            "type": "new_message",
-            "session_id": session_id,
-            "content": payload.message,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
-        await ws_manager.notify_dashboard(company_id, {
-            "type": "typing_start",
-            "session_id": session_id,
-        })
+        await notify_visitor_message(company_id, session_id, payload.message, "widget")
+        await notify_ai_typing(company_id, session_id)
 
         chat_request = ChatRequest(
             session_id=session_id,
@@ -1038,12 +1073,7 @@ async def widget_ask(
         )
         chat_response = await chat(company_id, chat_request)
 
-        await ws_manager.notify_dashboard(company_id, {
-            "type": "ai_reply",
-            "session_id": session_id,
-            "content": chat_response.reply,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        })
+        await notify_ai_reply(company_id, session_id, chat_response.reply, "widget")
 
         return WidgetChatResponse(
             answer=chat_response.reply,

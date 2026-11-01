@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import secrets as secrets_module
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import urlencode
 
 import httpx
@@ -44,6 +44,14 @@ from services.apps_integration.apps_integration_service import (
     _exchange_for_long_lived_user_token,
     get_ai_reply,
     is_duplicate_message,
+)
+from services.chatbot.live_chat import (
+    is_human_takeover,
+    notify_ai_reply,
+    notify_ai_typing,
+    notify_visitor_message,
+    remember_channel,
+    save_visitor_message,
 )
 from utils.token_encryption import TokenEncryptionError, decrypt_token, encrypt_token
 
@@ -80,6 +88,33 @@ class MetaSendError(Exception):
 class MetaTokenExpiredError(MetaSendError):
     """Raised when Meta rejects a Send API call for an auth/token reason —
     the caller should mark the connection token_expired, not just log it."""
+
+
+class MetaWindowClosedError(MetaSendError):
+    """Meta only allows a free-form reply within 24 hours of the customer's
+    last message. Not a broken connection — just too late to reply."""
+
+
+_WINDOW_CLOSED_MESSAGE = (
+    "Can't send: the customer's last message was more than 24 hours ago, "
+    "and Meta only allows replies within 24 hours."
+)
+
+
+def _raise_send_error(channel_label: str, status_code: int, error: dict[str, Any]) -> None:
+    """Turns a Send API error body into the right MetaSendError subclass.
+    Only code 190 means the token itself is dead — code 10 is also an
+    OAuthException, but it means the 24-hour reply window has closed, which
+    must not flip a healthy connection to token_expired."""
+    code = error.get("code")
+    if code == 190:
+        raise MetaTokenExpiredError(f"{channel_label} access token is invalid or expired")
+    if code in (10, 131047) or error.get("error_subcode") in (2018278, 2534022):
+        raise MetaWindowClosedError(_WINDOW_CLOSED_MESSAGE)
+    detail = str(error.get("message") or "").strip()
+    raise MetaSendError(
+        f"{channel_label} send failed ({status_code})" + (f": {detail}" if detail else "")
+    )
 
 
 # ── OAuth state (identifies which company an inbound callback belongs to) ──
@@ -682,14 +717,7 @@ async def send_meta_message(access_token: str, recipient_id: str, text: str) -> 
             "channel_send.failed status=%d error_type=%s error_code=%s",
             resp.status_code, error.get("type"), error.get("code"),
         )
-        # OAuthException (and the related "invalid session"/190 code) is
-        # Meta's signal that the token itself is the problem, not the
-        # request — anything else (rate limit, bad recipient, etc.) is a
-        # transient/one-off failure that shouldn't flip the connection to
-        # token_expired.
-        if error.get("type") == "OAuthException" or error.get("code") == 190:
-            raise MetaTokenExpiredError("Page access token is invalid or expired")
-        raise MetaSendError(f"Meta send failed: {resp.status_code}")
+        _raise_send_error("Page", resp.status_code, error)
 
 
 # ── Incoming message pipeline (used by routers/meta_webhook_router.py) ─────
@@ -741,36 +769,117 @@ async def handle_incoming_channel_message(
         # Neither Messenger nor Instagram has a separate "session" concept —
         # the sender's PSID/IGSID itself is the session, so the same
         # conversation always resumes with the same history.
-        reply = await get_ai_reply(
-            channel.value, connection.company_id, session_id=sender_id, message=message_text
+        await _run_channel_turn(
+            db, connection, channel, external_id, sender_id, message_text,
+            send=lambda reply: send_meta_message(access_token, sender_id, reply),
         )
-        if not reply:
-            return
-
-        try:
-            await send_meta_message(access_token, sender_id, reply)
-            logger.info(
-                "channel_message.reply_sent channel=%s external_id=%s recipient_id=%s",
-                channel.value, external_id, sender_id,
-            )
-        except MetaTokenExpiredError:
-            logger.warning(
-                "channel_message.token_expired channel=%s external_id=%s",
-                channel.value, external_id,
-            )
-            await mark_channel_connection_status(
-                db, connection.company_id, channel, external_id, ConnectionStatus.token_expired
-            )
-        except MetaSendError:
-            logger.exception(
-                "channel_message.send_failed channel=%s external_id=%s",
-                channel.value, external_id,
-            )
     except Exception:
         logger.exception(
             "channel_message.handler_error channel=%s external_id=%s message_id=%s",
             channel.value, external_id, message_id,
         )
+
+
+async def _run_channel_turn(
+    db: AsyncIOMotorDatabase,
+    connection: ChannelConnectionDoc,
+    channel: ChannelType,
+    external_id: str,
+    session_id: str,
+    message_text: str,
+    send: Callable[[str], Awaitable[None]],
+) -> None:
+    """One visitor message on Messenger / Instagram / WhatsApp, after the
+    connection is resolved: show it live on the dashboard, then either hold
+    it for the human who took over the conversation, or ask the AI and send
+    its reply back through `send`."""
+    company_id = connection.company_id
+    await remember_channel(db, company_id, session_id, channel.value, external_id)
+
+    if await is_human_takeover(db, company_id, session_id):
+        timestamp = await save_visitor_message(db, company_id, session_id, message_text)
+        await notify_visitor_message(company_id, session_id, message_text, channel.value, timestamp)
+        logger.info(
+            "channel_message.held_for_human channel=%s external_id=%s",
+            channel.value, external_id,
+        )
+        return
+
+    await notify_visitor_message(company_id, session_id, message_text, channel.value)
+    await notify_ai_typing(company_id, session_id)
+
+    reply = await get_ai_reply(channel.value, company_id, session_id=session_id, message=message_text)
+    if not reply:
+        return
+    # Already saved to the session by the chat endpoint, so the dashboard
+    # shows it whether or not Meta accepts the send below.
+    await notify_ai_reply(company_id, session_id, reply, channel.value)
+
+    try:
+        await send(reply)
+        logger.info(
+            "channel_message.reply_sent channel=%s external_id=%s",
+            channel.value, external_id,
+        )
+    except MetaTokenExpiredError:
+        logger.warning(
+            "channel_message.token_expired channel=%s external_id=%s",
+            channel.value, external_id,
+        )
+        await mark_channel_connection_status(
+            db, company_id, channel, external_id, ConnectionStatus.token_expired
+        )
+    except MetaSendError:
+        logger.exception(
+            "channel_message.send_failed channel=%s external_id=%s",
+            channel.value, external_id,
+        )
+
+
+async def send_owner_reply_to_channel(
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    channel: ChannelType,
+    external_id: str,
+    recipient_id: str,
+    text: str,
+) -> None:
+    """Sends a reply the business owner typed on the dashboard (during
+    human takeover) to the customer on Messenger / Instagram / WhatsApp.
+    Raises MetaSendError with a message safe to show the owner."""
+    doc = await db[CHANNEL_CONNECTIONS_COLLECTION].find_one({
+        "company_id": company_id,
+        "channel": channel.value,
+        "external_id": external_id,
+        "status": ConnectionStatus.active.value,
+    })
+    if not doc:
+        raise MetaSendError(
+            f"Your {channel.value.capitalize()} connection is no longer active — "
+            "reconnect it in Apps & Integrations."
+        )
+    try:
+        access_token = decrypt_token(doc["encrypted_access_token"])
+    except TokenEncryptionError as exc:
+        raise MetaSendError(
+            f"Your {channel.value.capitalize()} connection needs to be reconnected."
+        ) from exc
+
+    try:
+        if channel == ChannelType.whatsapp:
+            await send_whatsapp_message(access_token, external_id, recipient_id, text)
+        else:
+            await send_meta_message(access_token, recipient_id, text)
+    except MetaTokenExpiredError as exc:
+        await mark_channel_connection_status(
+            db, company_id, channel, external_id, ConnectionStatus.token_expired
+        )
+        raise MetaSendError(
+            f"Your {channel.value.capitalize()} connection has expired — "
+            "reconnect it in Apps & Integrations."
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise MetaSendError("Couldn't reach Meta to send this message — please try again.") from exc
 
 
 # ═══ WhatsApp (Embedded Signup) ═════════════════════════════════════════════
@@ -854,9 +963,7 @@ async def send_whatsapp_message(access_token: str, phone_number_id: str, to: str
             "whatsapp_send.failed status=%d error_type=%s error_code=%s",
             resp.status_code, error.get("type"), error.get("code"),
         )
-        if error.get("type") == "OAuthException" or error.get("code") == 190:
-            raise MetaTokenExpiredError("WhatsApp access token is invalid or expired")
-        raise MetaSendError(f"WhatsApp send failed: {resp.status_code}")
+        _raise_send_error("WhatsApp", resp.status_code, error)
 
 
 async def handle_incoming_whatsapp_message(
@@ -902,30 +1009,12 @@ async def handle_incoming_whatsapp_message(
         # WhatsApp has no separate "session" concept — the sender's wa_id
         # itself is the session, so the same conversation always resumes
         # with the same history.
-        reply = await get_ai_reply(
-            "whatsapp", connection.company_id, session_id=sender_wa_id, message=message_text
+        await _run_channel_turn(
+            db, connection, ChannelType.whatsapp, phone_number_id, sender_wa_id, message_text,
+            send=lambda reply: send_whatsapp_message(
+                access_token, phone_number_id, sender_wa_id, reply,
+            ),
         )
-        if not reply:
-            return
-
-        try:
-            await send_whatsapp_message(access_token, phone_number_id, sender_wa_id, reply)
-            logger.info(
-                "whatsapp_message.reply_sent phone_number_id=%s recipient_id=%s",
-                phone_number_id, sender_wa_id,
-            )
-        except MetaTokenExpiredError:
-            logger.warning(
-                "whatsapp_message.token_expired phone_number_id=%s", phone_number_id,
-            )
-            await mark_channel_connection_status(
-                db, connection.company_id, ChannelType.whatsapp, phone_number_id,
-                ConnectionStatus.token_expired,
-            )
-        except MetaSendError:
-            logger.exception(
-                "whatsapp_message.send_failed phone_number_id=%s", phone_number_id,
-            )
     except Exception:
         logger.exception(
             "whatsapp_message.handler_error phone_number_id=%s message_id=%s",

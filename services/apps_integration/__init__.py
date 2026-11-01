@@ -13,6 +13,7 @@ from services.apps_integration.channel_connections_service import (
     ChannelOAuthError,
     MetaSendError,
     MetaTokenExpiredError,
+    MetaWindowClosedError,
     build_authorize_url,
     confirm_channel_connections,
     connect_whatsapp_embedded,
@@ -24,6 +25,7 @@ from services.apps_integration.channel_connections_service import (
     handle_incoming_channel_message,
     handle_incoming_whatsapp_message,
     list_company_channel_connections,
+    send_owner_reply_to_channel,
     send_whatsapp_message,
 )
 
@@ -40,6 +42,7 @@ __all__ = [
     "ChannelOAuthError",
     "MetaSendError",
     "MetaTokenExpiredError",
+    "MetaWindowClosedError",
     "build_authorize_url",
     "confirm_channel_connections",
     "connect_whatsapp_embedded",
@@ -51,5 +54,6 @@ __all__ = [
     "handle_incoming_channel_message",
     "handle_incoming_whatsapp_message",
     "list_company_channel_connections",
+    "send_owner_reply_to_channel",
     "send_whatsapp_message",
 ]
