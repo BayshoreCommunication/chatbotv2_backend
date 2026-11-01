@@ -64,7 +64,13 @@ _PENDING_SELECTION_TTL_MINUTES = 10
 
 
 class ChannelOAuthError(Exception):
-    pass
+    """`code` is a short machine-readable reason the OAuth callback passes
+    to the dashboard as ?oauth_error=<code>, so the user sees *why* the
+    connect failed instead of one generic message."""
+
+    def __init__(self, message: str, code: str = "failed") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class MetaSendError(Exception):
@@ -91,14 +97,14 @@ def decode_oauth_state(state: str) -> str:
     try:
         payload = jwt.decode(state, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
     except JWTError as exc:
-        raise ChannelOAuthError("Invalid or expired OAuth state") from exc
+        raise ChannelOAuthError("Invalid or expired OAuth state", code="invalid_state") from exc
 
     if payload.get("purpose") != "meta_oauth_state":
-        raise ChannelOAuthError("Invalid OAuth state")
+        raise ChannelOAuthError("Invalid OAuth state", code="invalid_state")
 
     company_id = payload.get("company_id")
     if not isinstance(company_id, str) or not company_id:
-        raise ChannelOAuthError("Invalid OAuth state")
+        raise ChannelOAuthError("Invalid OAuth state", code="invalid_state")
     return company_id
 
 
@@ -134,7 +140,7 @@ async def _list_oauth_candidate_pages(user_access_token: str) -> list[dict[str, 
             "channel_oauth.accounts_lookup_failed status=%d body=%s",
             resp.status_code, resp.text,
         )
-        raise ChannelOAuthError("Failed to look up this user's Facebook Pages")
+        raise ChannelOAuthError("Failed to look up this user's Facebook Pages", code="pages_lookup_failed")
 
     pages = resp.json().get("data", [])
     candidates: list[dict[str, Any]] = []
@@ -193,12 +199,13 @@ async def exchange_code_and_list_pages(db: AsyncIOMotorDatabase, company_id: str
         )
         user_access_token = await _exchange_for_long_lived_user_token(short_lived)
     except MetaOAuthExchangeError as exc:
-        raise ChannelOAuthError(str(exc)) from exc
+        raise ChannelOAuthError(str(exc), code="token_exchange_failed") from exc
 
     candidates = await _list_oauth_candidate_pages(user_access_token)
     if not candidates:
         raise ChannelOAuthError(
-            "No Facebook Pages found for this login — connect a Page in Business Manager first."
+            "No Facebook Pages found for this login — connect a Page in Business Manager first.",
+            code="no_pages",
         )
 
     return await _create_pending_selection(db, company_id, candidates)

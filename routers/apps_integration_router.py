@@ -333,7 +333,15 @@ async def channel_oauth_callback(
         company_id = decode_oauth_state(state)
         selection_id = await exchange_code_and_list_pages(db, company_id, code)
     except ChannelOAuthError as exc:
-        logger.warning("channel_oauth.callback_failed error=%s", exc)
+        # exc.code tells the dashboard which step failed (invalid_state,
+        # token_exchange_failed, pages_lookup_failed, no_pages) so it can
+        # show a specific message instead of one generic error.
+        logger.warning("channel_oauth.callback_failed code=%s error=%s", exc.code, exc)
+        return RedirectResponse(f"{dashboard_url}?oauth_error={exc.code}")
+    except Exception:
+        # e.g. a network error talking to Meta — still a full-page browser
+        # navigation, so redirect back rather than showing a raw 500.
+        logger.exception("channel_oauth.callback_unexpected_error")
         return RedirectResponse(f"{dashboard_url}?oauth_error=failed")
 
     return RedirectResponse(f"{dashboard_url}?selection_id={selection_id}")
