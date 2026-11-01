@@ -118,6 +118,10 @@ class ChannelConnectionDoc(BaseModel):
     page_name: str = ""
     connected_at: datetime = Field(default_factory=datetime.utcnow)
     status: ConnectionStatus = ConnectionStatus.active
+    # Messenger rows only: contact details read off the Page at connect
+    # time, used to suggest/prefill WhatsApp Embedded Signup.
+    whatsapp_number: str = ""
+    website: str = ""
 
 
 # ── OAuth connect flow (server-redirect, not the JS-SDK popup Messenger
@@ -159,6 +163,16 @@ class ChannelConnectionSummary(BaseModel):
     page_name: str
     status: ConnectionStatus
     connected_at: datetime
+    whatsapp_number: str = ""
+    website: str = ""
+
+    @classmethod
+    def from_doc(cls, doc: "ChannelConnectionDoc") -> "ChannelConnectionSummary":
+        return cls(
+            id=doc.id or "", channel=doc.channel, external_id=doc.external_id,
+            page_name=doc.page_name, status=doc.status, connected_at=doc.connected_at,
+            whatsapp_number=doc.whatsapp_number, website=doc.website,
+        )
 
 
 class ChannelConnectionsListResponse(BaseModel):

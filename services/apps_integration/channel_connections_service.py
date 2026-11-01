@@ -299,6 +299,11 @@ async def confirm_channel_connections(
 
         saved.append(await save_channel_connection(
             db, company_id, ChannelType.messenger, candidate["id"], page_token, candidate["name"],
+            # Lets the dashboard offer "connect the WhatsApp number on this
+            # Page" and prefill WhatsApp Embedded Signup with the business
+            # details — WhatsApp itself still has to be verified in Meta's
+            # own popup.
+            extra_fields=await _fetch_page_contact_info(candidate["id"], page_token),
         ))
 
         if candidate.get("linked_instagram_id"):
@@ -316,6 +321,33 @@ async def confirm_channel_connections(
 
     await db[OAUTH_PENDING_SELECTIONS_COLLECTION].delete_one({"_id": selection_id})
     return saved
+
+
+async def _fetch_page_contact_info(page_id: str, page_access_token: str) -> dict[str, str]:
+    """Best-effort read of the WhatsApp number and website shown on the
+    Page. Never raises — a Page without them (or a lookup Meta rejects)
+    just means the dashboard has nothing to suggest."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{GRAPH_API_BASE_URL}/{page_id}",
+                headers={"Authorization": f"Bearer {page_access_token}"},
+                params={"fields": "whatsapp_number,website"},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("channel_oauth.page_contact_lookup_failed page_id=%s error=%s", page_id, exc)
+        return {}
+    if resp.status_code >= 400:
+        logger.warning(
+            "channel_oauth.page_contact_lookup_failed page_id=%s status=%d body=%s",
+            page_id, resp.status_code, resp.text,
+        )
+        return {}
+    body = resp.json()
+    return {
+        "whatsapp_number": str(body.get("whatsapp_number") or ""),
+        "website": str(body.get("website") or ""),
+    }
 
 
 # ── Graph API: subscribe / unsubscribe a Page's webhook ─────────────────────
@@ -407,6 +439,8 @@ async def save_channel_connection(
         page_name=page_name,
         connected_at=now,
         status=ConnectionStatus.active,
+        whatsapp_number=(extra_fields or {}).get("whatsapp_number", ""),
+        website=(extra_fields or {}).get("website", ""),
     )
 
 
@@ -420,6 +454,8 @@ def _doc_to_model(doc: dict[str, Any]) -> ChannelConnectionDoc:
         page_name=doc.get("page_name", ""),
         connected_at=doc["connected_at"],
         status=ConnectionStatus(doc.get("status", ConnectionStatus.active.value)),
+        whatsapp_number=doc.get("whatsapp_number", ""),
+        website=doc.get("website", ""),
     )
 
 

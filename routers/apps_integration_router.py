@@ -376,10 +376,7 @@ async def confirm_channel_oauth_selection(
 
     return ChannelConnectionsListResponse(
         connections=[
-            ChannelConnectionSummary(
-                id=c.id or "", channel=c.channel, external_id=c.external_id,
-                page_name=c.page_name, status=c.status, connected_at=c.connected_at,
-            )
+            ChannelConnectionSummary.from_doc(c)
             for c in saved
         ]
     )
@@ -393,10 +390,7 @@ async def list_channel_connections(
     connections = await list_company_channel_connections(db, current_user["id"])
     return ChannelConnectionsListResponse(
         connections=[
-            ChannelConnectionSummary(
-                id=c.id or "", channel=c.channel, external_id=c.external_id,
-                page_name=c.page_name, status=c.status, connected_at=c.connected_at,
-            )
+            ChannelConnectionSummary.from_doc(c)
             for c in connections
         ]
     )
@@ -439,7 +433,4 @@ async def connect_whatsapp_via_embedded_signup(
     except ChannelOAuthError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    return ChannelConnectionSummary(
-        id=connection.id or "", channel=connection.channel, external_id=connection.external_id,
-        page_name=connection.page_name, status=connection.status, connected_at=connection.connected_at,
-    )
+    return ChannelConnectionSummary.from_doc(connection)
