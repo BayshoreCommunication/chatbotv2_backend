@@ -28,6 +28,7 @@ from routers import (
 )
 from routers.chat_router import widget_router
 from services.admin.admin_auth import seed_super_admin
+from services.apps_integration import ensure_channel_connection_indexes
 from services.subscription.subscription_service import (
     process_overdue_subscriptions,
     send_ending_soon_reminders,
@@ -83,6 +84,7 @@ async def _overdue_check_loop() -> None:
 async def lifespan(app: FastAPI):
     await connect_to_mongo()
     await seed_super_admin(get_database())
+    await ensure_channel_connection_indexes(get_database())
     reminder_task = asyncio.create_task(_subscription_reminder_loop())
     overdue_task  = asyncio.create_task(_overdue_check_loop())
     yield

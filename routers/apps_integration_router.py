@@ -74,6 +74,8 @@ from model.apps_integration_model import (
     ChannelType,
     MessengerConnectRequest,
     MessengerEmbeddedConnectRequest,
+    MessengerPublicSettings,
+    MessengerSettings,
     MessengerSettingsResponse,
     OAuthConfirmRequest,
     OAuthInitiateResponse,
@@ -98,6 +100,14 @@ def _verify_meta_challenge(
     ):
         return int(hub_challenge) if hub_challenge.isdigit() else hub_challenge
     raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Verification failed")
+
+
+def _public_messenger_settings(company_settings: MessengerSettings) -> MessengerPublicSettings:
+    """Strips the Page access token before anything goes back to the
+    browser — the token is only ever used server-side."""
+    return MessengerPublicSettings(
+        page_id=company_settings.page_id, page_name=company_settings.page_name,
+    )
 
 
 async def get_current_user(
@@ -173,7 +183,7 @@ async def get_messenger_snapshot(
 ):
     company_settings = await get_company_messenger_settings(db, current_user["id"])
     connected = bool(company_settings.access_token and company_settings.page_id)
-    return MessengerSettingsResponse(settings=company_settings, connected=connected)
+    return MessengerSettingsResponse(settings=_public_messenger_settings(company_settings), connected=connected)
 
 
 @router.post("/messenger/connect", response_model=MessengerSettingsResponse)
@@ -198,7 +208,7 @@ async def connect_messenger(
         access_token=payload.access_token,
         page_name=page_name,
     )
-    return MessengerSettingsResponse(settings=company_settings, connected=True)
+    return MessengerSettingsResponse(settings=_public_messenger_settings(company_settings), connected=True)
 
 
 @router.post("/messenger/connect-embedded", response_model=MessengerSettingsResponse)
@@ -217,7 +227,7 @@ async def connect_messenger_via_login_for_business(
     except MessengerEmbeddedSignupError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(exc))
 
-    return MessengerSettingsResponse(settings=company_settings, connected=True)
+    return MessengerSettingsResponse(settings=_public_messenger_settings(company_settings), connected=True)
 
 
 @router.delete("/messenger/settings")

@@ -24,8 +24,16 @@ class MessengerSettings(BaseModel):
     page_name: str = ""
 
 
+# What the dashboard gets back — deliberately no access_token. The Page
+# token stays server-side; the browser only ever needs to know which Page
+# is connected.
+class MessengerPublicSettings(BaseModel):
+    page_id: str = ""
+    page_name: str = ""
+
+
 class MessengerSettingsResponse(BaseModel):
-    settings: MessengerSettings
+    settings: MessengerPublicSettings
     connected: bool
 
 

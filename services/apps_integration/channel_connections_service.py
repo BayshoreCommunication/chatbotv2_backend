@@ -302,6 +302,9 @@ async def confirm_channel_connections(
                 candidate["linked_instagram_id"],
                 page_token,
                 candidate.get("linked_instagram_name") or candidate["name"],
+                # IG DMs arrive through the Page's webhook subscription, so
+                # disconnect needs to know which Page this account rides on.
+                extra_fields={"linked_page_id": candidate["id"]},
             ))
 
     await db[OAUTH_PENDING_SELECTIONS_COLLECTION].delete_one({"_id": selection_id})
@@ -324,12 +327,33 @@ async def subscribe_page_to_app(page_id: str, page_access_token: str) -> None:
         raise MetaSendError(f"Failed to subscribe Page {page_id} to webhooks")
 
 
-async def unsubscribe_page_from_app(page_id: str, page_access_token: str) -> None:
+async def subscribe_waba_to_app(waba_id: str, access_token: str) -> None:
+    """WhatsApp's /{waba_id}/subscribed_apps takes no subscribed_fields —
+    which fields arrive is set once on the App's webhook config instead."""
     async with httpx.AsyncClient(timeout=20.0) as client:
-        resp = await client.delete(
-            f"{GRAPH_API_BASE_URL}/{page_id}/subscribed_apps",
-            params={"access_token": page_access_token},
+        resp = await client.post(
+            f"{GRAPH_API_BASE_URL}/{waba_id}/subscribed_apps",
+            headers={"Authorization": f"Bearer {access_token}"},
         )
+    if resp.status_code >= 400:
+        logger.error(
+            "whatsapp_connect.subscribe_failed waba_id=%s status=%d body=%s",
+            waba_id, resp.status_code, resp.text,
+        )
+        raise MetaSendError(f"Failed to subscribe WhatsApp account {waba_id} to webhooks")
+
+
+async def unsubscribe_page_from_app(page_id: str, page_access_token: str) -> None:
+    """Works for a Page id or a WABA id — both use DELETE /{id}/subscribed_apps."""
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.delete(
+                f"{GRAPH_API_BASE_URL}/{page_id}/subscribed_apps",
+                params={"access_token": page_access_token},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("channel_oauth.unsubscribe_network_error id=%s error=%s", page_id, exc)
+        return
     if resp.status_code >= 400:
         # Best-effort — don't block a user from disconnecting in our system
         # just because Meta's side failed (token may already be dead, which
@@ -349,13 +373,17 @@ async def save_channel_connection(
     external_id: str,
     access_token_plaintext: str,
     page_name: str,
+    extra_fields: dict[str, Any] | None = None,
 ) -> ChannelConnectionDoc:
+    """`extra_fields` holds channel-specific ids disconnect needs later —
+    `linked_page_id` on Instagram rows, `waba_id` on WhatsApp rows."""
     now = datetime.now(timezone.utc)
     encrypted = encrypt_token(access_token_plaintext)
     await db[CHANNEL_CONNECTIONS_COLLECTION].update_one(
         {"company_id": company_id, "channel": channel.value, "external_id": external_id},
         {
             "$set": {
+                **(extra_fields or {}),
                 "encrypted_access_token": encrypted,
                 "page_name": page_name,
                 "connected_at": now,
@@ -400,21 +428,59 @@ async def get_channel_connection_by_external_id(
 ) -> ChannelConnectionDoc | None:
     """Reverse lookup used by the webhook — Meta's payload only carries the
     Page/IG id, so this is how an incoming message finds *whose* knowledge
-    base to use. Matches regardless of status so the handler can log the
-    specific reason (expired vs. disconnected) instead of treating every
-    non-match identically."""
-    doc = await db[CHANNEL_CONNECTIONS_COLLECTION].find_one(
-        {"channel": channel.value, "external_id": external_id}
+    base to use.
+
+    The same Page/number can have rows under more than one company (e.g.
+    company A disconnected it — soft delete keeps the row — and company B
+    connected it afterwards), so an active row always wins, newest first.
+    Only when no active row exists does it fall back to any row, so the
+    handler can still log the specific reason (expired vs. disconnected)."""
+    query = {"channel": channel.value, "external_id": external_id}
+    newest_first = [("connected_at", -1)]
+    collection = db[CHANNEL_CONNECTIONS_COLLECTION]
+    doc = await collection.find_one(
+        {**query, "status": ConnectionStatus.active.value}, sort=newest_first
     )
+    if not doc:
+        doc = await collection.find_one(query, sort=newest_first)
     return _doc_to_model(doc) if doc else None
 
 
 async def mark_channel_connection_status(
-    db: AsyncIOMotorDatabase, channel: ChannelType, external_id: str, status: ConnectionStatus
+    db: AsyncIOMotorDatabase,
+    company_id: str,
+    channel: ChannelType,
+    external_id: str,
+    status: ConnectionStatus,
 ) -> None:
     await db[CHANNEL_CONNECTIONS_COLLECTION].update_one(
-        {"channel": channel.value, "external_id": external_id},
+        {"company_id": company_id, "channel": channel.value, "external_id": external_id},
         {"$set": {"status": status.value}},
+    )
+
+
+async def ensure_channel_connection_indexes(db: AsyncIOMotorDatabase) -> None:
+    """Called once at startup. create_index is a no-op when the index
+    already exists, so this is safe to run on every boot."""
+    connections = db[CHANNEL_CONNECTIONS_COLLECTION]
+    try:
+        # One row per (company, channel, Page/number) — matches the upsert
+        # key in save_channel_connection, so two concurrent confirms can't
+        # insert duplicates.
+        await connections.create_index(
+            [("company_id", 1), ("channel", 1), ("external_id", 1)], unique=True,
+        )
+    except Exception:
+        # Existing duplicate rows make the unique build fail — log and keep
+        # booting rather than taking the whole API down over it.
+        logger.exception("channel_connections.unique_index_failed")
+    # Webhook lookup (get_channel_connection_by_external_id).
+    await connections.create_index([("channel", 1), ("external_id", 1), ("status", 1)])
+    # Mongo's TTL monitor deletes abandoned pending selections (and the
+    # encrypted tokens inside them) once expires_at passes — otherwise they
+    # only get cleaned up if someone happens to open them again.
+    await db[OAUTH_PENDING_SELECTIONS_COLLECTION].create_index(
+        "expires_at", expireAfterSeconds=0,
     )
 
 
@@ -422,28 +488,111 @@ async def disconnect_channel_connection(
     db: AsyncIOMotorDatabase, company_id: str, channel: ChannelType, external_id: str
 ) -> bool:
     """Soft delete — sets status=disconnected, keeps the row for history.
-    Best-effort unsubscribes from Meta's side first (see
-    unsubscribe_page_from_app: failures there don't block this)."""
+    Then best-effort unsubscribes on Meta's side, but only once nothing
+    else still depends on that subscription (see _unsubscribe_if_unused;
+    failures there don't block this)."""
     doc = await db[CHANNEL_CONNECTIONS_COLLECTION].find_one(
         {"company_id": company_id, "channel": channel.value, "external_id": external_id}
     )
     if not doc:
         return False
 
-    try:
-        token = decrypt_token(doc["encrypted_access_token"])
-        await unsubscribe_page_from_app(external_id, token)
-    except (TokenEncryptionError, MetaSendError) as exc:
-        logger.warning(
-            "channel_oauth.disconnect_unsubscribe_skipped channel=%s external_id=%s error=%s",
-            channel.value, external_id, exc,
-        )
-
     await db[CHANNEL_CONNECTIONS_COLLECTION].update_one(
         {"_id": doc["_id"]},
         {"$set": {"status": ConnectionStatus.disconnected.value}},
     )
+    await _unsubscribe_if_unused(db, doc)
     return True
+
+
+async def _page_still_in_use(
+    db: AsyncIOMotorDatabase, company_id: str, page_id: str, page_token: str
+) -> bool:
+    """True while any active Messenger connection for this Page, or any
+    active Instagram connection riding on it, remains — Meta delivers both
+    through the one Page subscription, so unsubscribing it would silently
+    cut off the other."""
+    collection = db[CHANNEL_CONNECTIONS_COLLECTION]
+    active = ConnectionStatus.active.value
+    if await collection.find_one(
+        {
+            "status": active,
+            "$or": [
+                {"channel": ChannelType.messenger.value, "external_id": page_id},
+                {"channel": ChannelType.instagram.value, "linked_page_id": page_id},
+            ],
+        },
+        {"_id": 1},
+    ):
+        return True
+
+    # Instagram rows saved before linked_page_id existed: they were saved
+    # with the same Page token as their Page, so match on that instead.
+    async for ig_doc in collection.find(
+        {
+            "company_id": company_id,
+            "channel": ChannelType.instagram.value,
+            "status": active,
+            "linked_page_id": {"$exists": False},
+        },
+        {"encrypted_access_token": 1},
+    ):
+        try:
+            if decrypt_token(ig_doc["encrypted_access_token"]) == page_token:
+                return True
+        except TokenEncryptionError:
+            continue
+    return False
+
+
+async def _unsubscribe_if_unused(db: AsyncIOMotorDatabase, doc: dict[str, Any]) -> None:
+    channel = ChannelType(doc["channel"])
+    external_id = doc["external_id"]
+
+    if channel == ChannelType.whatsapp:
+        # Webhooks are subscribed on the WABA, not the phone number.
+        target_id = doc.get("waba_id")
+    elif channel == ChannelType.instagram:
+        target_id = doc.get("linked_page_id")
+    else:
+        target_id = external_id
+
+    if not target_id:
+        logger.info(
+            "channel_oauth.disconnect_unsubscribe_skipped channel=%s external_id=%s reason=no_target_id",
+            channel.value, external_id,
+        )
+        return
+
+    try:
+        token = decrypt_token(doc["encrypted_access_token"])
+    except TokenEncryptionError as exc:
+        logger.warning(
+            "channel_oauth.disconnect_unsubscribe_skipped channel=%s external_id=%s error=%s",
+            channel.value, external_id, exc,
+        )
+        return
+
+    if channel == ChannelType.whatsapp:
+        in_use = await db[CHANNEL_CONNECTIONS_COLLECTION].find_one(
+            {
+                "channel": ChannelType.whatsapp.value,
+                "waba_id": target_id,
+                "status": ConnectionStatus.active.value,
+            },
+            {"_id": 1},
+        ) is not None
+    else:
+        in_use = await _page_still_in_use(db, doc["company_id"], target_id, token)
+
+    if in_use:
+        logger.info(
+            "channel_oauth.disconnect_unsubscribe_skipped channel=%s external_id=%s reason=still_in_use",
+            channel.value, external_id,
+        )
+        return
+
+    await unsubscribe_page_from_app(target_id, token)
 
 
 # ── Send API ──────────────────────────────────────────────────────────────
@@ -539,7 +688,7 @@ async def handle_incoming_channel_message(
                 channel.value, external_id,
             )
             await mark_channel_connection_status(
-                db, channel, external_id, ConnectionStatus.token_expired
+                db, connection.company_id, channel, external_id, ConnectionStatus.token_expired
             )
         except MetaSendError:
             logger.exception(
@@ -575,21 +724,23 @@ async def connect_whatsapp_embedded(
     except MetaOAuthExchangeError as exc:
         raise ChannelOAuthError(str(exc)) from exc
 
-    # Best-effort — a subscribe failure shouldn't block the connection from
-    # saving (same lesson as the Page/Instagram subscribe calls above: Meta
-    # rejecting this call is recoverable, losing the connection entirely isn't).
+    # Required, not best-effort: without this subscription no incoming
+    # message ever reaches our webhook, so saving the connection anyway
+    # would show "Connected" on a number the bot can never answer.
     try:
-        await subscribe_page_to_app(waba_id, access_token)
+        await subscribe_waba_to_app(waba_id, access_token)
     except MetaSendError as exc:
-        logger.warning(
-            "whatsapp_connect.subscribe_failed waba_id=%s error=%s", waba_id, exc,
-        )
+        raise ChannelOAuthError(
+            "Couldn't finish connecting WhatsApp — Meta didn't let us subscribe this number "
+            "to incoming messages. Please try again."
+        ) from exc
 
     display_name = await _fetch_whatsapp_display_name(phone_number_id, access_token)
 
     return await save_channel_connection(
         db, company_id, ChannelType.whatsapp, phone_number_id, access_token,
         display_name or phone_number_id,
+        extra_fields={"waba_id": waba_id},
     )
 
 
@@ -697,7 +848,8 @@ async def handle_incoming_whatsapp_message(
                 "whatsapp_message.token_expired phone_number_id=%s", phone_number_id,
             )
             await mark_channel_connection_status(
-                db, ChannelType.whatsapp, phone_number_id, ConnectionStatus.token_expired
+                db, connection.company_id, ChannelType.whatsapp, phone_number_id,
+                ConnectionStatus.token_expired,
             )
         except MetaSendError:
             logger.exception(
