@@ -168,17 +168,43 @@ async def toggle_takeover(
         raise HTTPException(status.HTTP_403_FORBIDDEN, detail="Access denied.")
     db = get_database()
     now = datetime.now(timezone.utc)
+
+    # Only one conversation per company can be taken over at a time: taking
+    # over a new one hands every other one back to the AI. updated_at is left
+    # alone on those so releasing them doesn't reshuffle the chat list.
+    released: list[str] = []
+    if payload.active:
+        released = [
+            str(doc["session_id"])
+            async for doc in db["chat_sessions"].find(
+                {"company_id": company_id, "human_takeover": True, "session_id": {"$ne": session_id}},
+                {"session_id": 1},
+            )
+        ]
+        if released:
+            await db["chat_sessions"].update_many(
+                {"company_id": company_id, "session_id": {"$in": released}},
+                {"$set": {"human_takeover": False}},
+            )
+
     await db["chat_sessions"].update_one(
         {"company_id": company_id, "session_id": session_id},
         {"$set": {"human_takeover": payload.active, "updated_at": now}},
         upsert=True,
     )
-    session_key = f"{company_id}:{session_id}"
-    await ws_manager.push_to_widget(session_key, {
-        "type": "takeover_status",
-        "active": payload.active,
-    })
-    return {"ok": True, "human_takeover": payload.active}
+
+    for changed_session_id, active in [(session_id, payload.active)] + [(s, False) for s in released]:
+        await ws_manager.push_to_widget(f"{company_id}:{changed_session_id}", {
+            "type": "takeover_status",
+            "active": active,
+        })
+        # Keeps every open dashboard tab (and team member) in sync.
+        await ws_manager.notify_dashboard(company_id, {
+            "type": "takeover_changed",
+            "session_id": changed_session_id,
+            "active": active,
+        })
+    return {"ok": True, "human_takeover": payload.active, "released_session_ids": released}
 
 
 # ── Owner reply ───────────────────────────────────────────────────────────────
