@@ -148,10 +148,15 @@ def build_authorize_url(company_id: str) -> str:
     params = {
         "client_id": settings.META_APP_ID,
         "redirect_uri": settings.META_OAUTH_REDIRECT_URI,
-        "scope": _OAUTH_SCOPES,
         "response_type": "code",
         "state": _mint_oauth_state(company_id),
     }
+    # The permissions come from the Facebook Login for Business configuration
+    # when one is set; `scope` is only a fallback for local dev apps.
+    if settings.META_MESSENGER_CONFIG_ID:
+        params["config_id"] = settings.META_MESSENGER_CONFIG_ID
+    else:
+        params["scope"] = _OAUTH_SCOPES
     return f"https://www.facebook.com/{settings.META_GRAPH_API_VERSION}/dialog/oauth?{urlencode(params)}"
 
 

@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     META_APP_SECRET: str = ""
     META_WEBHOOK_VERIFY_TOKEN: str = ""
     META_GRAPH_API_VERSION: str = "v21.0"
+    # Facebook Login for Business configuration used by the Messenger /
+    # Instagram connect flow. Business-type apps must log in with a config_id:
+    # a plain `scope` login only works for people with a role on the app,
+    # everyone else gets Meta's "Feature Unavailable" page.
+    META_MESSENGER_CONFIG_ID: str = ""
     # Not currently read anywhere in the backend — reserved for the OAuth
     # connect flow being built against ChannelConnectionDoc.
     META_OAUTH_REDIRECT_URI: str = ""
